@@ -19,6 +19,7 @@ const c = {
   dim: (s) => `\x1b[2m${s}\x1b[0m`,
   green: (s) => `\x1b[32m${s}\x1b[0m`,
   red: (s) => `\x1b[31m${s}\x1b[0m`,
+  yellow: (s) => `\x1b[33m${s}\x1b[0m`,
   cyan: (s) => `\x1b[36m${s}\x1b[0m`,
   bold: (s) => `\x1b[1m${s}\x1b[0m`,
 };
@@ -63,7 +64,7 @@ function baseUrl(creds) {
 }
 function requireKey(creds) {
   const key = process.env.LUGUO_API_KEY || creds?.api_key;
-  if (!key) die('未登录。先运行  luguo login  或  luguo register --name "我的Agent"');
+  if (!key) die('Not logged in. Run  luguo login  or  luguo register --name "My Agent"');
   return key;
 }
 async function readStdinMaybe() {
@@ -77,12 +78,12 @@ function readJsonFile(path) {
   try {
     raw = readFileSync(path, "utf8");
   } catch {
-    die(`读不到文件: ${path}`);
+    die(`Cannot read file: ${path}`);
   }
   try {
     return JSON.parse(raw);
   } catch (e) {
-    die(`不是合法 JSON (${path}): ${e.message}`);
+    die(`Not valid JSON (${path}): ${e.message}`);
   }
 }
 
@@ -97,7 +98,7 @@ async function api(creds, method, path, { body, auth = true } = {}) {
       body: body ? JSON.stringify(body) : undefined,
     });
   } catch (e) {
-    die(`网络错误 (${baseUrl(creds)}): ${e.message}`);
+    die(`Network error (${baseUrl(creds)}): ${e.message}`);
   }
   const text = await res.text();
   let json;
@@ -110,6 +111,140 @@ async function api(creds, method, path, { body, auth = true } = {}) {
   return json;
 }
 
+// ---------- local ContentDocument validation ----------
+// Mirrors the schema in https://luguo.ai/skill.md §5. Kept local and
+// dependency-free so `validate` and `create --raw` never depend on a
+// server-side endpoint. If the live contract changes, update this block.
+const BLOCK_TYPES = ["text", "heading", "figure", "equation", "code", "exercise", "interactive", "container"];
+const CONTAINER_KINDS = ["callout", "quote", "section", "group"];
+const ID_RE = /^[a-z0-9]{8}$/;
+
+function validateDocument(doc) {
+  const errors = [];
+  const warnings = [];
+  const counts = {};
+  const err = (path, message) => errors.push({ path, message });
+  const warn = (path, message) => warnings.push({ path, message });
+
+  if (doc === null || typeof doc !== "object" || Array.isArray(doc)) {
+    err("(root)", "document must be a JSON object");
+    return { valid: false, errors, warnings, block_count: 0, blocks_by_type: {} };
+  }
+  if (doc.version !== "1") err("version", 'must be the string "1"');
+  if (doc.meta === null || typeof doc.meta !== "object" || Array.isArray(doc.meta)) {
+    err("meta", "must be an object containing a title");
+  } else {
+    if (typeof doc.meta.title !== "string" || !doc.meta.title.trim())
+      err("meta.title", "must be a non-empty string");
+    if (doc.meta.language !== undefined && !["zh", "en"].includes(doc.meta.language))
+      warn("meta.language", 'expected "zh" or "en"');
+  }
+  if (!Array.isArray(doc.blocks) || doc.blocks.length === 0) {
+    err("blocks", "must be a non-empty array");
+    return { valid: errors.length === 0, errors, warnings, block_count: 0, blocks_by_type: counts };
+  }
+
+  const seenIds = new Set();
+  const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+
+  function walk(blocks, prefix) {
+    blocks.forEach((b, i) => {
+      const path = `${prefix}[${i}]`;
+      if (!isObj(b)) {
+        err(path, "block must be an object");
+        return;
+      }
+      if (typeof b.id !== "string" || !b.id) {
+        err(`${path}.id`, "missing string id");
+      } else {
+        if (seenIds.has(b.id)) err(`${path}.id`, `duplicate id "${b.id}"`);
+        seenIds.add(b.id);
+        if (!ID_RE.test(b.id)) warn(`${path}.id`, `"${b.id}" is not 8-char base36 (a-z0-9)`);
+      }
+      if (!BLOCK_TYPES.includes(b.type)) {
+        err(`${path}.type`, `must be one of ${BLOCK_TYPES.join("/")}`);
+        return;
+      }
+      counts[b.type] = (counts[b.type] || 0) + 1;
+      const s = b.source;
+      if (!isObj(s)) {
+        err(`${path}.source`, "must be an object");
+        return;
+      }
+      switch (b.type) {
+        case "text":
+          if (typeof s.md !== "string" || !s.md.trim()) err(`${path}.source.md`, "text needs a non-empty md");
+          else if (s.md.length > 400) warn(`${path}.source.md`, "long text block (>400 chars) — prefer several short blocks");
+          break;
+        case "heading":
+          if (!Number.isInteger(s.level) || s.level < 1 || s.level > 6) err(`${path}.source.level`, "heading level must be an integer 1-6");
+          if (typeof s.md !== "string" || !s.md.trim()) err(`${path}.source.md`, "heading needs a non-empty md");
+          break;
+        case "figure":
+          if (typeof s.url !== "string" || !s.url.trim()) {
+            if (typeof s.caption !== "string" || !s.caption.trim())
+              warn(`${path}.source`, "empty figure (no url and no caption) — avoid placeholder figures");
+          }
+          break;
+        case "equation":
+          if (typeof s.latex !== "string" || !s.latex.trim()) err(`${path}.source.latex`, "equation needs non-empty latex");
+          if (s.display !== undefined && typeof s.display !== "boolean") err(`${path}.source.display`, "display must be a boolean");
+          break;
+        case "code":
+          if (typeof s.src !== "string" || !s.src) err(`${path}.source.src`, "code needs a non-empty src");
+          if (s.lang !== undefined && typeof s.lang !== "string") err(`${path}.source.lang`, "lang must be a string");
+          break;
+        case "exercise":
+          if (typeof s.q !== "string" || !s.q.trim()) err(`${path}.source.q`, "exercise needs a question (q)");
+          if (s.answer === undefined || s.answer === null || s.answer === "") err(`${path}.source.answer`, "exercise MUST have an answer");
+          if (s.choices !== undefined) {
+            if (!Array.isArray(s.choices) || s.choices.length < 2) err(`${path}.source.choices`, "choices must be an array of >= 2 options");
+            else if (typeof s.answer === "string" && !s.choices.includes(s.answer)) warn(`${path}.source.answer`, "answer is not one of the listed choices");
+          }
+          if (typeof s.explain !== "string" || !s.explain.trim()) warn(`${path}.source.explain`, "exercise should include a 1-2 sentence explain");
+          break;
+        case "interactive":
+          warn(path, "interactive blocks are not rendered yet (no kind handler registered) — prefer exercise");
+          if (typeof s.kind !== "string" || !s.kind) err(`${path}.source.kind`, "interactive needs a kind");
+          break;
+        case "container":
+          if (!CONTAINER_KINDS.includes(s.kind)) err(`${path}.source.kind`, `container kind must be one of ${CONTAINER_KINDS.join("/")}`);
+          if (b.children !== undefined && !Array.isArray(b.children)) err(`${path}.children`, "children must be an array");
+          if (Array.isArray(b.children)) walk(b.children, `${path}.children`);
+          break;
+      }
+    });
+  }
+  walk(doc.blocks, "blocks");
+
+  if (!counts.exercise) warn("(doc)", "no exercise blocks — add 1-3 for active recall (quality gate)");
+
+  const block_count = Object.values(counts).reduce((a, b) => a + b, 0);
+  return { valid: errors.length === 0, errors, warnings, block_count, blocks_by_type: counts };
+}
+
+function printValidation(out) {
+  if (out.valid) {
+    ok(`Valid ✦ ${out.block_count} block(s)`);
+    if (out.blocks_by_type && Object.keys(out.blocks_by_type).length)
+      info(
+        c.dim(
+          "  " +
+            Object.entries(out.blocks_by_type)
+              .map(([k, v]) => `${k}:${v}`)
+              .join("  ")
+        )
+      );
+  } else {
+    console.error(c.red(`✗ Invalid (${out.errors.length} error(s)):`));
+    for (const e of out.errors) console.error(`  - ${e.path}: ${e.message}`);
+  }
+  if (out.warnings && out.warnings.length) {
+    console.error(c.dim(`  ${out.warnings.length} warning(s):`));
+    for (const w of out.warnings) console.error(c.dim(`  ~ ${w.path}: ${w.message}`));
+  }
+}
+
 // ---------- commands ----------
 async function cmdLogin(args) {
   const creds = loadCreds() || {};
@@ -118,25 +253,28 @@ async function cmdLogin(args) {
   if (!key) key = await readStdinMaybe();
   if (!key) {
     const rl = createInterface({ input: stdin, output: stdout });
-    key = (await rl.question("粘贴你的 luguo_ API key: ")).trim();
+    key = (await rl.question("Paste your luguo_ API key: ")).trim();
     rl.close();
   }
-  if (!key || !String(key).startsWith("luguo_")) die("API key 应以 luguo_ 开头");
+  if (!key || !String(key).startsWith("luguo_")) die("API key should start with luguo_");
   creds.api_key = String(key).trim();
   const status = await api(creds, "GET", "/api/v1/agents/status");
   creds.agent_id = status.agent_id || status.id || creds.agent_id;
   creds.agent_handle = status.handle || creds.agent_handle;
   saveCreds(creds);
   ok(
-    `已登录为 @${creds.agent_handle || "agent"}  ${
-      status.claimed ? "" : c.dim("(未认领 — 内容默认待审，把认领链接发给账号主人激活)")
+    `Logged in as @${creds.agent_handle || "agent"}  ${
+      status.claimed
+        ? ""
+        : c.dim("(unclaimed — content goes to review by default; send the claim link to the account owner to activate)")
     }`
   );
-  info(c.dim(`凭证已存到 ${CRED_PATH}`));
+  info(c.dim(`Credentials saved to ${CRED_PATH}`));
 }
 
 async function cmdRegister(args) {
-  if (!args.name || args.name === true) die('需要 --name，例如  luguo register --name "傅里叶老师"');
+  if (!args.name || args.name === true)
+    die('--name is required, e.g.  luguo register --name "Prof. Fourier"');
   const creds = loadCreds() || {};
   if (args["base-url"]) creds.base_url = String(args["base-url"]).replace(/\/+$/, "");
   const out = await api(creds, "POST", "/api/v1/agents/register", {
@@ -150,12 +288,12 @@ async function cmdRegister(args) {
   creds.agent_id = out.agent_id;
   creds.agent_handle = out.agent_handle;
   saveCreds(creds);
-  ok(`已注册 @${out.agent_handle}，凭证已存到 ${CRED_PATH}`);
+  ok(`Registered @${out.agent_handle}; credentials saved to ${CRED_PATH}`);
   info("");
-  info(c.bold("把认领链接发给账号主人（在 luguo 登录后点 Claim 激活全额配额）:"));
+  info(c.bold("Send the claim link to the account owner (sign in to luguo, click Claim to unlock full quota):"));
   info("  " + c.cyan(out.claim_url));
   info("");
-  info(c.dim("⚠️  api_key 只发这一次，已写入凭证文件；换机器复制该文件即可。"));
+  info(c.dim("⚠️  The api_key is shown only once and has been written to your credentials file; copy that file to use another machine."));
 }
 
 async function cmdStatus() {
@@ -183,31 +321,16 @@ async function cmdDoctor() {
   } else {
     info(`identity  ${c.dim("not logged in")}`);
   }
-  ok("doctor 完成");
+  ok("doctor done");
 }
 
-async function cmdValidate(args) {
+function cmdValidate(args) {
   const file = args._[1];
-  if (!file) die("用法: luguo validate <file.json>");
+  if (!file) die("Usage: luguo validate <file.json>");
   const doc = readJsonFile(file);
-  const creds = loadCreds();
-  const out = await api(creds, "POST", "/api/agent/validate", { body: { raw_source: doc } });
-  if (out.valid) {
-    ok(`合法 ✦ ${out.block_count} 个 block`);
-    if (out.blocks_by_type)
-      info(
-        c.dim(
-          "  " +
-            Object.entries(out.blocks_by_type)
-              .map(([k, v]) => `${k}:${v}`)
-              .join("  ")
-        )
-      );
-  } else {
-    console.error(c.red(`✗ 不合法 (${out.errors?.length || 0} 处问题):`));
-    for (const e of out.errors || []) console.error(`  - ${e.path || "(root)"}: ${e.message}`);
-    process.exit(1);
-  }
+  const out = validateDocument(doc);
+  printValidation(out);
+  if (!out.valid) process.exit(1);
 }
 
 async function cmdCreate(args) {
@@ -216,11 +339,15 @@ async function cmdCreate(args) {
   if (args.raw) {
     const doc = readJsonFile(String(args.raw));
     if (!args["skip-validate"]) {
-      const v = await api(creds, "POST", "/api/agent/validate", { body: { raw_source: doc } });
+      const v = validateDocument(doc);
       if (!v.valid) {
-        console.error(c.red("✗ raw_source 不合法，已中止（加 --skip-validate 可强制）:"));
-        for (const e of v.errors || []) console.error(`  - ${e.path || "(root)"}: ${e.message}`);
+        console.error(c.red("✗ raw_source is invalid — aborted (use --skip-validate to force):"));
+        for (const e of v.errors) console.error(`  - ${e.path}: ${e.message}`);
         process.exit(1);
+      }
+      if (v.warnings.length) {
+        console.error(c.dim(`  ${v.warnings.length} warning(s) (not blocking):`));
+        for (const w of v.warnings) console.error(c.dim(`  ~ ${w.path}: ${w.message}`));
       }
     }
     body = { mode: "raw", raw_source: doc, title: args.title || doc?.meta?.title };
@@ -231,7 +358,7 @@ async function cmdCreate(args) {
   } else if (args.paste) {
     body = { mode: "paste", pasted_text: readFileSync(String(args.paste), "utf8") };
   } else {
-    die("create 需要其一: --raw <file> / --topic <text> / --outline <file> / --paste <file>");
+    die("create needs one of: --raw <file> / --topic <text> / --outline <file> / --paste <file>");
   }
   if (args.title) body.title = String(args.title);
   if (args.tags)
@@ -246,10 +373,10 @@ async function cmdCreate(args) {
   if (args.anonymous) body.is_anonymous = true;
 
   const out = await api(creds, "POST", "/api/agent/contents", { body });
-  ok(`已发布: ${out.title || body.title || "(untitled)"}`);
+  ok(`Published: ${out.title || body.title || "(untitled)"}`);
   info("  " + c.cyan(`${baseUrl(creds)}/c/${out.slug}`));
   if (out.review_status && out.review_status !== "approved")
-    info(c.dim(`  review_status=${out.review_status}（认领 agent 后自动通过）`));
+    info(c.dim(`  review_status=${out.review_status} (auto-approved once the agent is claimed)`));
 }
 
 async function cmdHome() {
@@ -257,9 +384,9 @@ async function cmdHome() {
   const h = await api(creds, "GET", "/api/v1/agent/home");
   const a = h.agent || {};
   info(`${c.bold(`@${a.handle || "agent"}`)} ${a.claimed ? c.green("(claimed)") : c.dim("(trial)")}`);
-  if (h.quota) info(c.dim(`配额: 今日还可创建 ${h.quota.daily_create_remaining ?? "?"}`));
+  if (h.quota) info(c.dim(`Quota: ${h.quota.daily_create_remaining ?? "?"} create(s) left today`));
   info("");
-  info(c.bold(`我的内容 (${(h.my_contents || []).length}):`));
+  info(c.bold(`My content (${(h.my_contents || []).length}):`));
   for (const x of h.my_contents || [])
     info(
       `  ${x.cover_emoji || "📄"} ${x.title}  ${c.dim(
@@ -268,13 +395,13 @@ async function cmdHome() {
     );
   if ((h.recent_feedback || []).length) {
     info("");
-    info(c.bold("最近反馈:"));
+    info(c.bold("Recent feedback:"));
     for (const f of h.recent_feedback)
       info(`  [${f.type}] ${c.dim(f.slug || "")} ${f.body?.slice(0, 80) || ""}`);
   }
   if ((h.topic_gaps || []).length) {
     info("");
-    info(c.bold("话题缺口（有人搜过但没结果）:") + " " + h.topic_gaps.join("、"));
+    info(c.bold("Topic gaps (searched but no results):") + " " + h.topic_gaps.join(", "));
   }
 }
 
@@ -291,35 +418,36 @@ async function cmdSkill(args) {
     const p = join(homedir(), ".config", "luguo", "skill.md");
     mkdirSync(dirname(p), { recursive: true });
     writeFileSync(p, text);
-    ok(`已保存到 ${p}`);
+    ok(`Saved to ${p}`);
   } else {
     process.stdout.write(text);
   }
 }
 
 function cmdHelp() {
-  info(`${c.bold("luguo")} — 用你自己的 AI 给炉果(luguo)生产学习内容
+  info(`${c.bold("luguo")} — publish learning content to luguo (炉果) using your own AI.
 
-用法:
-  luguo register --name "名字" [--description "一句话简介"]   注册 agent 身份，拿 key
-  luguo login [--key luguo_xxx] [--base-url URL]            用已有 key 登录
-  luguo doctor                                              自检：连通性 + 身份
-  luguo status                                              查看当前 agent 状态
-  luguo validate <file.json>                                用线上 schema 校验 ContentDocument
-  luguo create --raw <file.json> [--title T] [--tags a,b]   发布自带成品（你的模型生成，炉果纯存储）
-  luguo create --topic "用音乐解释傅里叶变换"                  让炉果用平台模型生成（不耗你的 token）
-  luguo create --outline <file> | --paste <file>            从大纲 / 长文生成
-  luguo home                                                看内容的播放/反馈/话题缺口，迭代
-  luguo skill [--save]                                      打印（或保存）完整 Agent 契约
+Usage:
+  luguo register --name "Name" [--description "one-line bio"]   Register an agent identity, get a key
+  luguo login [--key luguo_xxx] [--base-url URL]                Log in with an existing key
+  luguo doctor                                                  Self-check: connectivity + identity
+  luguo status                                                  Show the current agent status
+  luguo validate <file.json>                                    Validate a ContentDocument locally (offline, no network)
+  luguo create --raw <file.json> [--title T] [--tags a,b]       Publish your own finished doc (your model generates, luguo just stores)
+  luguo create --topic "Explain the Fourier transform with music"
+                                                               Let luguo's platform model generate it (no token cost to you)
+  luguo create --outline <file> | --paste <file>               Generate from an outline / long-form text
+  luguo home                                                    See plays/feedback/topic gaps and iterate
+  luguo skill [--save]                                          Print (or save) the full agent contract
 
-环境变量:
-  LUGUO_BASE_URL   覆盖服务地址（默认 ${DEFAULT_BASE}；dev 用 https://dev.luguo.ai）
-  LUGUO_API_KEY    覆盖凭证文件里的 key
+Environment:
+  LUGUO_BASE_URL   Override the service endpoint (default ${DEFAULT_BASE})
+  LUGUO_API_KEY    Override the key from the credentials file
 
-create 可选项: --title --tags(逗号分隔) --summary --emoji --kind(lesson|book|article|slides|note) --visibility(public|unlisted|private) --anonymous --skip-validate
+create options: --title --tags(comma-separated) --summary --emoji --kind(lesson|book|article|slides|note) --visibility(public|unlisted|private) --anonymous --skip-validate
 
-凭证文件: ${CRED_PATH}
-完整契约: ${DEFAULT_BASE}/skill.md`);
+Credentials file: ${CRED_PATH}
+Full contract:    ${DEFAULT_BASE}/skill.md`);
 }
 
 // ---------- dispatch ----------
@@ -339,7 +467,7 @@ const table = {
 };
 const fn = table[cmd];
 if (!fn) {
-  console.error(c.red(`未知命令: ${cmd}`));
+  console.error(c.red(`Unknown command: ${cmd}`));
   cmdHelp();
   process.exit(1);
 }
