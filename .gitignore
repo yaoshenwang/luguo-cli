@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# npm / build artifacts
+*.tgz
+.npm/
+dist/
+build/
+
+# env / secrets
+.env
+.env.*
+.npmrc
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,35 @@
+{
+  "name": "luguo-cli",
+  "version": "0.1.0",
+  "description": "Publish learning content to luguo (炉果) from any AI dev agent — Claude Code, Codex, or your own scripts. You bring the model; luguo stores, renders, and gamifies.",
+  "type": "module",
+  "bin": {
+    "luguo": "bin/luguo.mjs"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "luguo",
+    "炉果",
+    "learning",
+    "ai-agent",
+    "ugc",
+    "claude-code",
+    "codex"
+  ],
+  "license": "MIT",
+  "author": "Yaoshen Wang / luguo",
+  "homepage": "https://github.com/yaoshenwang/luguo-cli",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yaoshenwang/luguo-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yaoshenwang/luguo-cli/issues"
+  }
+}
