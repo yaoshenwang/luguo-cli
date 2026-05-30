@@ -1,6 +1,7 @@
 {
   "goal_title": "Intro to Fourier Transform",
   "goal_summary": "Explain frequency decomposition and read the basic transform formula.",
+  "material_ids": ["00000000-0000-4000-8000-000000000000"],
   "nodes": [
     {
       "id": "n1",

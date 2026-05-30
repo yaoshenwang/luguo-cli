@@ -1,7 +1,7 @@
 {
-  "title": "Fourier Transform Reference Pack",
+  "title": "Fourier Transform Reference Material",
   "summary": "Reference material explaining frequency-domain decomposition through sound.",
-  "source_kind": "cli",
+  "material_kind": "cli",
   "language": "en",
   "visibility": "private",
   "blocks": [

@@ -4,17 +4,21 @@ All notable changes to `luguo-cli` are documented here. This project follows
 [Semantic Versioning](https://semver.org/) and the
 [Keep a Changelog](https://keepachangelog.com/) format.
 
+## [0.1.2] - 2026-05-30
+
+### Changed
+- Replaced the CLI workflow with `material` and `plan` commands.
+- Updated HTTP calls to `/api/agent/materials`, `/api/agent/plans`, and the new validation contract.
+- Removed the direct lesson publishing command path from the CLI.
+- Renamed examples and docs to the final Material / Plan product language.
+
 ## [0.1.1] - 2026-05-30
 
 ### Added
-- `luguo source create <file>` and `luguo source list` for the current Source Pack-first backend model.
-- `luguo map create <file>` for optional Learning Map / KG creation.
-- `luguo validate <file>` artifact detection for Source Packs, Learning Maps, and legacy ContentDocuments, with server schema checks for Source Packs and Learning Maps.
-- Ready-to-run example JSON files for Source Pack, Learning Map, and legacy ContentDocument flows.
+- An intermediate structured-material workflow. This was superseded by 0.1.2.
 
 ### Changed
-- Updated the help text and English/Chinese READMEs to make Source Pack / Learning Map the recommended agent integration path.
-- Kept `luguo create` as a legacy direct lesson fallback instead of the primary flow.
+- Updated help text and English/Chinese READMEs for the intermediate workflow.
 
 ## [0.1.0] - 2026-05-29
 
@@ -24,12 +28,13 @@ First public release.
 - `luguo register` — register an agent identity, receive a `luguo_` API key (written to the credentials file automatically) along with a claim link.
 - `luguo login` — log in with an existing key (supports `--key` / stdin / interactive paste, and a `--base-url` override).
 - `luguo doctor` / `luguo status` — connectivity self-check and identity inspection.
-- `luguo validate <file.json>` — validate a ContentDocument **locally** (offline, zero-dependency; mirrors the live `skill.md` §5 schema). `create --raw` runs the same check before publishing.
-- `luguo create` — publish content in four modes: `--raw` (bring your own finished doc, zero platform cost) / `--topic` / `--outline` / `--paste`, with optional `--title --tags --summary --emoji --kind --visibility --anonymous`.
+- `luguo validate <file.json>` — validate agent-created JSON.
+- A first publishing workflow for early agent experiments.
 - `luguo home` — review plays / feedback / topic gaps for your own content.
 - `luguo skill [--save]` — print or save the full agent contract document.
 - Zero runtime dependencies (pure Node ≥ 18, using the global `fetch` and `node:` builtins).
 - Credentials stored at `~/.config/luguo/credentials.json` with `0600` permissions.
 
+[0.1.2]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/yaoshenwang/luguo-cli/releases/tag/v0.1.0

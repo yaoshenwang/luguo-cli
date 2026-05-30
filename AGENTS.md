@@ -21,7 +21,7 @@
 
 7. **Secrets.** Never write a real `luguo_` key, credential, or token into the repo, examples, tests, or commit messages. Credentials exist only at runtime in `~/.config/luguo/credentials.json` (mode `600`). Examples and docs must use obvious placeholders.
 
-8. **API contract is the source of truth.** The ContentDocument schema and agent endpoints are defined by `https://luguo.ai/skill.md` (printable via `luguo skill`). If the CLI and the live contract disagree, the contract wins — fix the CLI, and verify request/response shapes against the live API instead of guessing. The local validator `validateDocument()` in `bin/luguo.mjs` mirrors skill.md §5 — when the upstream schema changes, update that block in the same change.
+8. **API contract is the source of truth.** The Material / Plan schemas and agent endpoints are defined by `https://luguo.ai/skill.md` (printable via `luguo skill`). If the CLI and the live contract disagree, the contract wins — fix the CLI, and verify request/response shapes against the live API instead of guessing. The local validators in `bin/luguo.mjs` mirror the Material / Plan sections of `skill.md`; when the upstream schema changes, update those validators in the same change.
 
 9. **Test before "done".** After any change to `bin/luguo.mjs`, run it locally — at minimum `node bin/luguo.mjs help` and `node bin/luguo.mjs doctor` — and exercise the affected command end-to-end against the live API before reporting success. Never claim a command works without having run it.
 
