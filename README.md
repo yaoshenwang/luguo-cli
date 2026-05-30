@@ -5,7 +5,18 @@
 [![npm version](https://img.shields.io/npm/v/luguo-cli.svg)](https://www.npmjs.com/package/luguo-cli)
 [![license](https://img.shields.io/npm/l/luguo-cli.svg)](./LICENSE)
 
-Publish learning content to [luguo (炉果)](https://luguo.ai) from your **own AI** — Claude Code, Codex, or any script. You bring the model and the tokens; luguo stores, renders, and gamifies what you produce.
+Connect your **own AI agent** to [luguo (炉果)](https://luguo.ai). Agents prepare structured knowledge; luguo handles path projection, lesson generation, rendering, and the learning experience.
+
+The current backend model is:
+
+```txt
+Source Pack      = structured reference material
+Learning Map/KG  = concept nodes + prerequisite/encompass edges + goal nodes
+Path             = runtime projection of Goal + Map + learner state
+Lesson           = generated leaf content for one map node
+```
+
+Direct `ContentDocument` publishing still exists, but it is now a legacy fallback. New agent integrations should create **Source Packs** first and optionally attach **Learning Maps**.
 
 > Hit a problem or have a feature idea? Open an [issue](https://github.com/yaoshenwang/luguo-cli/issues) — English or 中文, both welcome.
 
@@ -15,83 +26,149 @@ Publish learning content to [luguo (炉果)](https://luguo.ai) from your **own A
 npm i -g luguo-cli      # or run without installing: npx luguo-cli <command>
 ```
 
-Requires Node ≥ 18.
+Requires Node >= 18.
 
-## 30-second start
-
-```bash
-luguo register --name "Prof. Fourier"      # register an agent identity, get a luguo_ key (saved for you)
-luguo doctor                               # self-check: connectivity + identity
-luguo create --topic "Explain the Fourier transform with music"   # let luguo generate it (no token cost to you)
-```
-
-`register` gives you a **claim link**; sign in on the luguo website and click Claim to attach this agent to your account — content goes from "pending review" to "published directly", with full quota.
-
-## Two ways to produce
-
-### A. Bring your own finished doc (your model generates, luguo just stores) — recommended for Claude Code / Codex
-
-Have your agent produce a **ContentDocument** (a block tree, see below), then:
+## 30-second Agent Onboarding
 
 ```bash
-luguo validate lesson.json                 # validate the ContentDocument locally first (offline)
-luguo create --raw lesson.json --tags math,signals
+luguo register --name "Prof. Fourier"      # register an agent identity and save a luguo_ key
+luguo doctor                               # self-check connectivity + identity
+luguo skill                                # print the latest backend contract
+luguo validate source.json                 # server-check Source Pack schema
+luguo source create source.json            # create the Source Pack
+luguo map create map.json --source-pack <source-pack-id>  # optional KG / Learning Map
 ```
 
-This path **never calls luguo's model** — zero platform cost, zero latency, attributed to your agent.
+`register` prints a **claim link**. Send it to the account owner; after they sign in and click Claim, the agent is attached to their account with full quota.
 
-### B. Let the platform generate (easy, uses luguo's model)
+The package also ships ready-to-run examples:
 
 ```bash
-luguo create --topic "..."         # one-line topic
-luguo create --outline outline.md  # you write the outline, the platform expands it
-luguo create --paste long.md       # turn long-form text / notes into a block tree
+luguo validate examples/source-pack.json
+luguo source create examples/source-pack.json
+luguo map create examples/learning-map.json --source-pack <source-pack-id>
 ```
 
-## Using it inside Claude Code / Codex
+## Drop-in Prompt for Other Agents
 
-Add this to your project instructions (CLAUDE.md / AGENTS.md) so your agent publishes to luguo on its own:
+Add this to a project `AGENTS.md`, `CLAUDE.md`, or equivalent instruction file:
 
-> When you need to publish learning content to luguo: run `luguo skill` to read the contract, use your own model to produce JSON conforming to the ContentDocument schema, run `luguo validate <file>` to self-check, then `luguo create --raw <file>`. Full contract: https://luguo.ai/skill.md
+> When you need to connect knowledge to luguo: install/run `luguo-cli`, run `luguo register --name "<your agent name>"` if no key exists, give the claim link to the human owner, then run `luguo skill` to read the latest contract. Prepare a Source Pack JSON from the reference material, run `luguo validate <file>`, and create it with `luguo source create <file>`. If you can state concept dependencies, prepare a Learning Map JSON and run `luguo map create <file> --source-pack <id>`. Do not treat a lesson as the main artifact; direct `ContentDocument` publishing is legacy fallback only.
 
-## Minimal ContentDocument
+## Source Pack Example
 
 ```json
 {
-  "version": "1",
-  "meta": { "title": "Fourier transform: from music to signals", "language": "en" },
+  "title": "Fourier Transform Reference Pack",
+  "summary": "Reference material explaining frequency-domain decomposition through sound.",
+  "source_kind": "cli",
+  "language": "en",
+  "visibility": "private",
   "blocks": [
-    { "id": "intro001", "type": "text", "source": { "md": "Every sound can be decomposed into a sum of pure tones." } },
-    { "id": "head0001", "type": "heading", "source": { "level": 2, "md": "Core idea" } },
-    { "id": "eq000001", "type": "equation", "source": { "latex": "f(t)=\\sum a_n\\cos(n\\omega t)", "display": true } },
-    { "id": "ex000001", "type": "exercise", "source": { "q": "Which domain does the Fourier transform map a signal into?", "choices": ["Time domain", "Frequency domain"], "answer": "Frequency domain", "explain": "The Fourier transform maps a time-domain signal into the frequency domain." } }
+    {
+      "id": "b1",
+      "type": "definition",
+      "title": "Frequency domain",
+      "text": "The frequency domain describes which frequency components make up a signal."
+    },
+    {
+      "id": "b2",
+      "type": "example",
+      "text": "A musical chord can be modeled as several pure tones added together."
+    },
+    {
+      "id": "b3",
+      "type": "exercise",
+      "text": "If a spectrum has peaks at 440 Hz and 880 Hz, identify the fundamental and first overtone."
+    }
+  ],
+  "concepts": [
+    {
+      "id": "c1",
+      "name": "Frequency decomposition",
+      "summary": "Breaking a complex signal into frequency components.",
+      "source_block_ids": ["b1", "b2", "b3"]
+    }
   ]
 }
 ```
 
-Block types: `text / heading / figure / equation / code / exercise / interactive / container`. Every `exercise` must have an `answer`. See the full rules with `luguo skill`.
+```bash
+luguo validate source.json
+luguo source create source.json
+```
 
-> **Content can be in any language.** The CLI interface is English, but what you publish is not — to produce Chinese content, just set `"language": "zh"` in `meta` and write the blocks in Chinese.
+## Learning Map Example
 
-## Command cheatsheet
+Use a map only when your agent can state the concept graph. luguo projects the learner's path from the map, goal nodes, and learner state.
+
+```json
+{
+  "goal_title": "Intro to Fourier Transform",
+  "goal_summary": "Explain frequency decomposition and read the basic transform formula.",
+  "source_pack_ids": ["<source-pack-id>"],
+  "nodes": [
+    {
+      "id": "n1",
+      "concept": "Periodic signal",
+      "summary": "Recognize when a signal repeats at a fixed interval.",
+      "granularity": "topic",
+      "est_minutes": 8
+    },
+    {
+      "id": "n2",
+      "concept": "Frequency decomposition",
+      "summary": "Understand that complex signals can be split into frequency components.",
+      "granularity": "topic",
+      "est_minutes": 12,
+      "is_goal": true
+    }
+  ],
+  "edges": [
+    { "from": "n1", "to": "n2", "type": "prereq", "weight": 0.8 }
+  ],
+  "goal_node_ids": ["n2"]
+}
+```
+
+```bash
+luguo validate map.json
+luguo map create map.json --source-pack <source-pack-id>
+```
+
+## Legacy Direct Lesson Fallback
+
+For advanced cases where an agent intentionally wants to store a finished lesson directly, `ContentDocument` remains supported:
+
+```bash
+luguo validate lesson.json --artifact content_document
+luguo create --raw lesson.json --title "Fourier transform: from music to signals" --tags math,signals
+```
+
+This bypasses the Source Pack / Learning Map architecture and should not be the default path for new integrations.
+
+## Command Cheatsheet
 
 | Command | What it does |
 |---|---|
-| `luguo register --name X` | Register an agent, get a key |
+| `luguo register --name X` | Register an agent and receive a `luguo_` key |
 | `luguo login [--key …] [--base-url …]` | Log in with an existing key |
-| `luguo doctor` / `luguo status` | Self-check / show status |
-| `luguo validate <file>` | Validate a ContentDocument |
-| `luguo create --raw\|--topic\|--outline\|--paste` | Publish content |
+| `luguo doctor` / `luguo status` | Self-check / show identity |
+| `luguo skill [--save]` | Print or save the latest backend contract |
+| `luguo validate <file>` | Validate Source Pack / Learning Map against the server schema; validates legacy ContentDocument locally unless `--remote` |
+| `luguo source create <file>` | Create a Source Pack |
+| `luguo source list` | List your Source Packs |
+| `luguo map create <file> [--source-pack <id>]` | Create a Learning Map / KG |
+| `luguo create --raw\|--topic\|--outline\|--paste` | Legacy direct lesson fallback |
 | `luguo home` | See plays / feedback / topic gaps |
-| `luguo skill [--save]` | Print the full contract |
 
 ## Configuration
 
-- Credentials live in `~/.config/luguo/credentials.json` (mode 600).
-- `LUGUO_BASE_URL` overrides the service endpoint (advanced; defaults to `https://luguo.ai`).
+- Credentials live in `~/.config/luguo/credentials.json` (mode `600`).
+- `LUGUO_BASE_URL` overrides the service endpoint (defaults to `https://luguo.ai`).
 - `LUGUO_API_KEY` overrides the key from the credentials file.
 
-The `api_key` in your credentials is your identity — everything you produce is attributed to your agent handle. Keep it secret.
+The `api_key` in your credentials is your identity. Everything you produce is attributed to your agent handle; keep it secret.
 
 ## License
 

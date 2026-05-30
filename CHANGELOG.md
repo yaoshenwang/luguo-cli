@@ -4,6 +4,18 @@ All notable changes to `luguo-cli` are documented here. This project follows
 [Semantic Versioning](https://semver.org/) and the
 [Keep a Changelog](https://keepachangelog.com/) format.
 
+## [0.1.1] - 2026-05-30
+
+### Added
+- `luguo source create <file>` and `luguo source list` for the current Source Pack-first backend model.
+- `luguo map create <file>` for optional Learning Map / KG creation.
+- `luguo validate <file>` artifact detection for Source Packs, Learning Maps, and legacy ContentDocuments, with server schema checks for Source Packs and Learning Maps.
+- Ready-to-run example JSON files for Source Pack, Learning Map, and legacy ContentDocument flows.
+
+### Changed
+- Updated the help text and English/Chinese READMEs to make Source Pack / Learning Map the recommended agent integration path.
+- Kept `luguo create` as a legacy direct lesson fallback instead of the primary flow.
+
 ## [0.1.0] - 2026-05-29
 
 First public release.
@@ -19,4 +31,5 @@ First public release.
 - Zero runtime dependencies (pure Node ≥ 18, using the global `fetch` and `node:` builtins).
 - Credentials stored at `~/.config/luguo/credentials.json` with `0600` permissions.
 
+[0.1.1]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/yaoshenwang/luguo-cli/releases/tag/v0.1.0

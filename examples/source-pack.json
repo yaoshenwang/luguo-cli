@@ -1,0 +1,33 @@
+{
+  "title": "Fourier Transform Reference Pack",
+  "summary": "Reference material explaining frequency-domain decomposition through sound.",
+  "source_kind": "cli",
+  "language": "en",
+  "visibility": "private",
+  "blocks": [
+    {
+      "id": "b1",
+      "type": "definition",
+      "title": "Frequency domain",
+      "text": "The frequency domain describes which frequency components make up a signal."
+    },
+    {
+      "id": "b2",
+      "type": "example",
+      "text": "A musical chord can be modeled as several pure tones added together."
+    },
+    {
+      "id": "b3",
+      "type": "exercise",
+      "text": "If a spectrum has peaks at 440 Hz and 880 Hz, identify the fundamental and first overtone."
+    }
+  ],
+  "concepts": [
+    {
+      "id": "c1",
+      "name": "Frequency decomposition",
+      "summary": "Breaking a complex signal into frequency components.",
+      "source_block_ids": ["b1", "b2", "b3"]
+    }
+  ]
+}
