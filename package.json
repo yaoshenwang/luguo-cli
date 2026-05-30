@@ -1,7 +1,7 @@
 {
   "name": "luguo-cli",
-  "version": "0.1.2",
-  "description": "Connect AI agents to luguo (炉果) by creating Materials and Plans from Claude Code, Codex, or your own scripts.",
+  "version": "0.1.3",
+  "description": "Publish Book projects to luguo (炉果) and generate conversational learning paths.",
   "type": "module",
   "bin": {
     "luguo": "bin/luguo.mjs"

@@ -4,6 +4,14 @@ All notable changes to `luguo-cli` are documented here. This project follows
 [Semantic Versioning](https://semver.org/) and the
 [Keep a Changelog](https://keepachangelog.com/) format.
 
+## [0.1.3] - 2026-05-30
+
+### Changed
+- Replaced the public workflow with Book projects: `init book`, `validate`, `publish`, `books`, and `open`.
+- Switched HTTP calls to `/api/agent/books` and the Book-only validation contract.
+- Removed `material` and `plan` command paths from the supported surface.
+- Added Quarto-lite `luguo.yml` + Markdown chapter examples.
+
 ## [0.1.2] - 2026-05-30
 
 ### Changed
@@ -35,6 +43,7 @@ First public release.
 - Zero runtime dependencies (pure Node ≥ 18, using the global `fetch` and `node:` builtins).
 - Credentials stored at `~/.config/luguo/credentials.json` with `0600` permissions.
 
+[0.1.3]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/yaoshenwang/luguo-cli/releases/tag/v0.1.0
