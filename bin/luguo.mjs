@@ -81,7 +81,7 @@ function absoluteUrl(creds, path) {
 
 function requireKey(creds) {
   const key = process.env.LUGUO_API_KEY || creds?.api_key;
-  if (!key) die('Not logged in. Run `luguo login` or `luguo register --name "My Agent"`.');
+  if (!key) die(`Not logged in. Create an agent key in ${baseUrl(creds)}/settings, then run \`luguo login --key luguo_xxx\`.`);
   return key;
 }
 
@@ -116,11 +116,29 @@ async function api(creds, method, path, { body, auth = true } = {}) {
   return json;
 }
 
+function rejectRemovedOptions(args, optionNames) {
+  for (const name of optionNames) {
+    if (args[name] !== undefined) {
+      die(`--${name} was removed. luguo-cli now publishes only the current editor ContentDocument format.`);
+    }
+  }
+}
+
 const VISIBILITIES = ["private", "public", "unlisted"];
 const BOOK_KINDS = ["cli", "manual", "upload", "official", "generated"];
 const BOOK_STATUSES = ["draft", "ready", "archived"];
-const PLAN_EDGE_TYPES = ["prereq", "encompass", "related"];
-const PLAN_GRANULARITIES = ["atom", "topic", "cluster"];
+const CONTENT_BLOCK_TYPES = [
+  "text",
+  "heading",
+  "figure",
+  "equation",
+  "code",
+  "exercise",
+  "interactive",
+  "container",
+  "keypoints",
+  "worked_example",
+];
 
 const isPlainObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 
@@ -152,76 +170,6 @@ function checkStringArray(errors, path, value, { optional = true } = {}) {
   }
 }
 
-function validatePlan(plan, prefix = "plan") {
-  const errors = [];
-  const warnings = [];
-  if (plan === undefined) return { errors, warnings, stats: {} };
-  if (!isPlainObject(plan)) {
-    errors.push({ path: prefix, message: "plan must be an object" });
-    return { errors, warnings, stats: { node_count: 0, edge_count: 0 } };
-  }
-  checkUnknown(errors, plan, new Set(["goal_title", "goal_summary", "nodes", "edges", "goal_node_ids"]), prefix);
-  checkString(errors, `${prefix}.goal_title`, plan.goal_title, "must be a non-empty string", { max: 160 });
-  checkString(errors, `${prefix}.goal_summary`, plan.goal_summary, "must be a string", { optional: true });
-  checkStringArray(errors, `${prefix}.goal_node_ids`, plan.goal_node_ids);
-
-  const nodeIds = new Set();
-  if (!Array.isArray(plan.nodes) || plan.nodes.length === 0) {
-    errors.push({ path: `${prefix}.nodes`, message: "must be a non-empty array" });
-  } else {
-    plan.nodes.forEach((node, index) => {
-      const path = `${prefix}.nodes[${index}]`;
-      if (!isPlainObject(node)) {
-        errors.push({ path, message: "node must be an object" });
-        return;
-      }
-      checkUnknown(errors, node, new Set(["id", "concept", "summary", "granularity", "est_minutes", "is_goal"]), path);
-      checkString(errors, `${path}.id`, node.id, "missing string id");
-      if (typeof node.id === "string") {
-        if (nodeIds.has(node.id)) errors.push({ path: `${path}.id`, message: `duplicate id "${node.id}"` });
-        nodeIds.add(node.id);
-      }
-      checkString(errors, `${path}.concept`, node.concept, "must be a non-empty string");
-      checkString(errors, `${path}.summary`, node.summary, "must be a string", { optional: true });
-      if (node.granularity !== undefined && !PLAN_GRANULARITIES.includes(node.granularity)) {
-        errors.push({ path: `${path}.granularity`, message: `must be one of ${PLAN_GRANULARITIES.join("/")}` });
-      }
-      if (node.est_minutes !== undefined && (!Number.isInteger(node.est_minutes) || node.est_minutes < 1 || node.est_minutes > 120)) {
-        errors.push({ path: `${path}.est_minutes`, message: "must be an integer from 1 to 120" });
-      }
-      if (node.is_goal !== undefined && typeof node.is_goal !== "boolean") {
-        errors.push({ path: `${path}.is_goal`, message: "must be a boolean" });
-      }
-    });
-  }
-
-  const edges = Array.isArray(plan.edges) ? plan.edges : [];
-  if (plan.edges !== undefined && !Array.isArray(plan.edges)) {
-    errors.push({ path: `${prefix}.edges`, message: "must be an array" });
-  } else {
-    edges.forEach((edge, index) => {
-      const path = `${prefix}.edges[${index}]`;
-      if (!isPlainObject(edge)) {
-        errors.push({ path, message: "edge must be an object" });
-        return;
-      }
-      checkUnknown(errors, edge, new Set(["from", "to", "type", "weight", "rationale"]), path);
-      checkString(errors, `${path}.from`, edge.from, "missing source node id");
-      checkString(errors, `${path}.to`, edge.to, "missing target node id");
-      if (!PLAN_EDGE_TYPES.includes(edge.type)) errors.push({ path: `${path}.type`, message: `must be one of ${PLAN_EDGE_TYPES.join("/")}` });
-      if (edge.weight !== undefined && (typeof edge.weight !== "number" || edge.weight < 0 || edge.weight > 1)) {
-        errors.push({ path: `${path}.weight`, message: "must be a number from 0 to 1" });
-      }
-      if (typeof edge.from === "string" && nodeIds.size && !nodeIds.has(edge.from)) errors.push({ path: `${path}.from`, message: `unknown node id "${edge.from}"` });
-      if (typeof edge.to === "string" && nodeIds.size && !nodeIds.has(edge.to)) errors.push({ path: `${path}.to`, message: `unknown node id "${edge.to}"` });
-    });
-  }
-  for (const id of plan.goal_node_ids || []) {
-    if (!nodeIds.has(id)) errors.push({ path: `${prefix}.goal_node_ids`, message: `unknown node id "${id}"` });
-  }
-  return { errors, warnings, stats: { node_count: Array.isArray(plan.nodes) ? plan.nodes.length : 0, edge_count: edges.length } };
-}
-
 function validateBook(book) {
   const errors = [];
   const warnings = [];
@@ -248,8 +196,6 @@ function validateBook(book) {
       "visibility",
       "quality",
       "meta",
-      "create_plan",
-      "plan",
     ])
   );
   checkString(errors, "title", book.title, "must be a non-empty string", { max: 160 });
@@ -264,7 +210,6 @@ function validateBook(book) {
   if (book.source_refs !== undefined && !Array.isArray(book.source_refs)) errors.push({ path: "source_refs", message: "must be an array" });
   if (book.quality !== undefined && !isPlainObject(book.quality)) errors.push({ path: "quality", message: "must be an object" });
   if (book.meta !== undefined && !isPlainObject(book.meta)) errors.push({ path: "meta", message: "must be an object" });
-  if (book.create_plan !== undefined && typeof book.create_plan !== "boolean") errors.push({ path: "create_plan", message: "must be a boolean" });
 
   const sectionIds = new Set();
   let sectionCount = 0;
@@ -330,16 +275,269 @@ function validateBook(book) {
     }
   }
 
-  const planValidation = validatePlan(book.plan);
-  errors.push(...planValidation.errors);
-  warnings.push(...planValidation.warnings);
-
   return result(errors, warnings, {
     chapter_count: Array.isArray(book.chapters) ? book.chapters.length : 0,
     section_count: sectionCount,
     concept_count: Array.isArray(book.concepts) ? book.concepts.length : 0,
-    ...planValidation.stats,
   });
+}
+
+function contentResult(errors, warnings, stats = {}) {
+  return { artifact: "content", valid: errors.length === 0, errors, warnings, ...stats };
+}
+
+function isContentDocument(value) {
+  return isPlainObject(value) && value.version === "1" && Array.isArray(value.blocks) && isPlainObject(value.meta);
+}
+
+function validateBlock(block, path, ids, errors) {
+  if (!isPlainObject(block)) {
+    errors.push({ path, message: "block must be an object" });
+    return 0;
+  }
+  checkUnknown(errors, block, new Set(["id", "type", "source", "meta", "children"]), path);
+  checkString(errors, `${path}.id`, block.id, "missing string id");
+  if (typeof block.id === "string") {
+    if (ids.has(block.id)) errors.push({ path: `${path}.id`, message: `duplicate id "${block.id}"` });
+    ids.add(block.id);
+  }
+  if (!CONTENT_BLOCK_TYPES.includes(block.type)) {
+    errors.push({ path: `${path}.type`, message: `must be one of ${CONTENT_BLOCK_TYPES.join("/")}` });
+    return 1;
+  }
+  if (!isPlainObject(block.source)) {
+    errors.push({ path: `${path}.source`, message: "source must be an object" });
+    return 1;
+  }
+  switch (block.type) {
+    case "text":
+      checkUnknown(errors, block.source, new Set(["md"]), `${path}.source`);
+      checkString(errors, `${path}.source.md`, block.source.md, "must be a string", { min: 0 });
+      break;
+    case "heading":
+      checkUnknown(errors, block.source, new Set(["level", "md"]), `${path}.source`);
+      if (!Number.isInteger(block.source.level) || block.source.level < 1 || block.source.level > 6) {
+        errors.push({ path: `${path}.source.level`, message: "must be an integer from 1 to 6" });
+      }
+      checkString(errors, `${path}.source.md`, block.source.md, "must be a string", { min: 0 });
+      break;
+    case "figure":
+      checkUnknown(errors, block.source, new Set(["url", "prompt", "alt", "caption"]), `${path}.source`);
+      checkString(errors, `${path}.source.url`, block.source.url, "must be a URL string", { optional: true });
+      checkString(errors, `${path}.source.prompt`, block.source.prompt, "must be a string", { optional: true });
+      checkString(errors, `${path}.source.alt`, block.source.alt, "must be a string", { optional: true });
+      checkString(errors, `${path}.source.caption`, block.source.caption, "must be a string", { optional: true });
+      break;
+    case "equation":
+      checkUnknown(errors, block.source, new Set(["latex", "display"]), `${path}.source`);
+      checkString(errors, `${path}.source.latex`, block.source.latex, "must be a string", { min: 0 });
+      if (block.source.display !== undefined && typeof block.source.display !== "boolean") {
+        errors.push({ path: `${path}.source.display`, message: "must be a boolean" });
+      }
+      break;
+    case "code":
+      checkUnknown(errors, block.source, new Set(["lang", "src", "runnable"]), `${path}.source`);
+      checkString(errors, `${path}.source.lang`, block.source.lang, "must be a string", { min: 0 });
+      checkString(errors, `${path}.source.src`, block.source.src, "must be a string", { min: 0 });
+      if (block.source.runnable !== undefined && typeof block.source.runnable !== "boolean") {
+        errors.push({ path: `${path}.source.runnable`, message: "must be a boolean" });
+      }
+      break;
+    case "exercise":
+      checkUnknown(errors, block.source, new Set(["q", "choices", "answer", "explain", "skills", "steps"]), `${path}.source`);
+      checkString(errors, `${path}.source.q`, block.source.q, "must be a string", { min: 0 });
+      checkString(errors, `${path}.source.answer`, block.source.answer, "must be a string", { min: 0 });
+      checkString(errors, `${path}.source.explain`, block.source.explain, "must be a string", { optional: true, min: 0 });
+      checkStringArray(errors, `${path}.source.choices`, block.source.choices);
+      checkStringArray(errors, `${path}.source.skills`, block.source.skills);
+      checkStringArray(errors, `${path}.source.steps`, block.source.steps);
+      break;
+    case "interactive":
+      checkUnknown(errors, block.source, new Set(["kind", "spec"]), `${path}.source`);
+      checkString(errors, `${path}.source.kind`, block.source.kind, "must be a non-empty string");
+      if (!isPlainObject(block.source.spec)) errors.push({ path: `${path}.source.spec`, message: "must be an object" });
+      break;
+    case "container":
+      checkUnknown(errors, block.source, new Set(["kind", "title", "tone"]), `${path}.source`);
+      if (block.source.kind !== undefined && !["callout", "quote", "section", "group"].includes(block.source.kind)) {
+        errors.push({ path: `${path}.source.kind`, message: "must be callout/quote/section/group" });
+      }
+      checkString(errors, `${path}.source.title`, block.source.title, "must be a string", { optional: true });
+      break;
+    case "keypoints":
+      checkUnknown(errors, block.source, new Set(["title", "points"]), `${path}.source`);
+      checkString(errors, `${path}.source.title`, block.source.title, "must be a string", { optional: true });
+      if (!Array.isArray(block.source.points) || block.source.points.length === 0) {
+        errors.push({ path: `${path}.source.points`, message: "must be a non-empty array" });
+      } else {
+        block.source.points.forEach((point, index) => {
+          const p = `${path}.source.points[${index}]`;
+          if (!isPlainObject(point)) {
+            errors.push({ path: p, message: "point must be an object" });
+            return;
+          }
+          checkUnknown(errors, point, new Set(["term", "md", "latex"]), p);
+          checkString(errors, `${p}.term`, point.term, "must be a string", { min: 0 });
+          checkString(errors, `${p}.md`, point.md, "must be a string", { optional: true, min: 0 });
+          checkString(errors, `${p}.latex`, point.latex, "must be a string", { optional: true, min: 0 });
+        });
+      }
+      break;
+    case "worked_example":
+      checkUnknown(errors, block.source, new Set(["title", "tag", "problem", "approach", "steps", "answer"]), `${path}.source`);
+      checkString(errors, `${path}.source.title`, block.source.title, "must be a string", { optional: true });
+      checkString(errors, `${path}.source.tag`, block.source.tag, "must be a string", { optional: true });
+      checkString(errors, `${path}.source.problem`, block.source.problem, "must be a string", { min: 0 });
+      checkString(errors, `${path}.source.approach`, block.source.approach, "must be a string", { optional: true, min: 0 });
+      checkString(errors, `${path}.source.answer`, block.source.answer, "must be a string", { optional: true, min: 0 });
+      if (block.source.steps !== undefined && !Array.isArray(block.source.steps)) {
+        errors.push({ path: `${path}.source.steps`, message: "must be an array" });
+      }
+      break;
+  }
+  let count = 1;
+  if (block.type === "container" && block.children !== undefined) {
+    if (!Array.isArray(block.children)) {
+      errors.push({ path: `${path}.children`, message: "must be an array" });
+    } else {
+      block.children.forEach((child, index) => {
+        count += validateBlock(child, `${path}.children[${index}]`, ids, errors);
+      });
+    }
+  }
+  return count;
+}
+
+function validateContentDocument(doc) {
+  const errors = [];
+  const warnings = [];
+  if (!isPlainObject(doc)) {
+    errors.push({ path: "(root)", message: "document must be a JSON object" });
+    return contentResult(errors, warnings, { block_count: 0 });
+  }
+  checkUnknown(errors, doc, new Set(["version", "blocks", "meta"]), "");
+  if (doc.version !== "1") errors.push({ path: "version", message: 'must be "1"' });
+  if (!isPlainObject(doc.meta)) {
+    errors.push({ path: "meta", message: "must be an object" });
+  } else {
+    checkString(errors, "meta.title", doc.meta.title, "must be a non-empty string");
+    checkString(errors, "meta.language", doc.meta.language, "must be a language string", { optional: true, min: 2, max: 16 });
+  }
+  const ids = new Set();
+  let blockCount = 0;
+  if (!Array.isArray(doc.blocks)) {
+    errors.push({ path: "blocks", message: "must be an array" });
+  } else {
+    doc.blocks.forEach((block, index) => {
+      blockCount += validateBlock(block, `blocks[${index}]`, ids, errors);
+    });
+  }
+  return contentResult(errors, warnings, { block_count: blockCount });
+}
+
+function nextBlockIdFactory() {
+  let n = 0;
+  return () => `b${String(++n).padStart(4, "0")}`;
+}
+
+function stripLeadingHeading(markdown) {
+  return String(markdown || "").replace(/^#{1,6}\s+.+(?:\r?\n|$)/, "").trim();
+}
+
+function blockToPlainText(block) {
+  switch (block.type) {
+    case "heading":
+    case "text":
+      return block.source.md || "";
+    case "equation":
+      return block.source.latex || "";
+    case "code":
+      return block.source.src || "";
+    case "exercise":
+      return [block.source.q, ...(block.source.choices || []), block.source.answer, block.source.explain].filter(Boolean).join(" ");
+    case "keypoints":
+      return [block.source.title, ...(block.source.points || []).map((p) => [p.term, p.md, p.latex].filter(Boolean).join(" "))].filter(Boolean).join(" ");
+    case "worked_example":
+      return [block.source.title, block.source.problem, block.source.approach, ...(block.source.steps || []).map((s) => [s.md, s.latex].filter(Boolean).join(" ")), block.source.answer].filter(Boolean).join(" ");
+    case "container":
+      return [block.source.title, ...(block.children || []).map(blockToPlainText)].filter(Boolean).join(" ");
+    default:
+      return "";
+  }
+}
+
+function makeSceneTitle(blocks, fallback) {
+  const heading = blocks.find((block) => block.type === "heading" && block.source.md?.trim());
+  if (heading) return heading.source.md.trim().slice(0, 48);
+  const text = blocks.map(blockToPlainText).find((part) => part.trim());
+  return text?.trim().slice(0, 48) || fallback;
+}
+
+function buildLessonOverlay(blocks) {
+  const scenes = [];
+  let current = [];
+  const flush = () => {
+    if (!current.length) return;
+    scenes.push({
+      id: `scene-${scenes.length + 1}`,
+      title: makeSceneTitle(current, `第 ${scenes.length + 1} 节`),
+      block_ids: current.map((block) => block.id),
+    });
+    current = [];
+  };
+  for (const block of blocks) {
+    if (block.type === "heading" && block.source.level <= 2) flush();
+    current.push(block);
+    if (block.type === "exercise") flush();
+  }
+  flush();
+  return scenes.length ? { scenes } : undefined;
+}
+
+function bookToContentDocument(book) {
+  const id = nextBlockIdFactory();
+  const blocks = [];
+  for (const chapter of book.chapters || []) {
+    blocks.push({ id: id(), type: "heading", source: { level: 2, md: chapter.title || "Chapter" } });
+    if (chapter.summary?.trim()) blocks.push({ id: id(), type: "text", source: { md: chapter.summary.trim() } });
+    for (const section of chapter.sections || []) {
+      blocks.push({ id: id(), type: "heading", source: { level: 3, md: section.title || "Section" } });
+      if (section.summary?.trim()) blocks.push({ id: id(), type: "text", source: { md: section.summary.trim() } });
+      const body = stripLeadingHeading(section.markdown);
+      if (body) blocks.push({ id: id(), type: "text", source: { md: body } });
+    }
+  }
+  const overlay = buildLessonOverlay(blocks);
+  return {
+    version: "1",
+    blocks,
+    meta: {
+      title: book.title,
+      language: book.language || "zh",
+      license: book.license,
+      refs: Array.isArray(book.source_refs)
+        ? book.source_refs
+            .map((ref) => (isPlainObject(ref) && typeof ref.title === "string" ? { title: ref.title, url: typeof ref.url === "string" ? ref.url : undefined } : null))
+            .filter(Boolean)
+        : undefined,
+      created_from: "luguo_cli",
+      source_format: "book_project",
+      ...(overlay ? { lesson_overlay: overlay } : {}),
+    },
+  };
+}
+
+function parseTags(raw) {
+  if (!raw) return [];
+  return String(raw)
+    .split(/[,，]/)
+    .map((tag) => tag.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
+function contentTitle(document, fallback) {
+  return document?.meta?.title?.trim?.() || fallback || "Untitled";
 }
 
 function readJsonFile(filePath) {
@@ -413,7 +611,25 @@ function loadBookProject(input = ".") {
   if (!existsSync(root)) die(`Path does not exist: ${input}`);
   const stat = statSync(root);
   if (stat.isFile()) {
-    if (extname(root).toLowerCase() === ".json") return { root: dirname(root), book: readJsonFile(root) };
+    if (extname(root).toLowerCase() === ".json") {
+      const json = readJsonFile(root);
+      if (isContentDocument(json)) {
+        return {
+          root: dirname(root),
+          document: json,
+          book: {
+            title: contentTitle(json, basename(root, extname(root))),
+            summary: json.meta.summary || "",
+            book_kind: "cli",
+            language: json.meta.language || "zh",
+            visibility: "private",
+            chapters: [{ id: "ch1", title: contentTitle(json, basename(root, extname(root))), sections: [{ id: "s1", title: contentTitle(json, basename(root, extname(root))), markdown: blockToPlainText({ type: "container", source: { title: "" }, children: json.blocks }), meta: {} }], meta: {} }],
+            meta: { imported_content_document: true },
+          },
+        };
+      }
+      return { root: dirname(root), book: json };
+    }
     const markdown = readFileSync(root, "utf8");
     const title = basename(root, extname(root));
     return {
@@ -486,34 +702,19 @@ function loadProjectState(input = ".") {
   return JSON.parse(readFileSync(statePath, "utf8"));
 }
 
-async function validateRemote(creds, book) {
-  const out = await api(creds, "POST", "/api/agent/validate", {
-    body: { artifact: "book", book },
-  });
-  return {
-    artifact: out.artifact || "book",
-    valid: !!out.valid,
-    errors: out.errors || out.issues || [],
-    warnings: out.warnings || [],
-    chapter_count: out.chapter_count,
-    section_count: out.section_count,
-    concept_count: out.concept_count,
-    node_count: out.node_count,
-    edge_count: out.edge_count,
-  };
-}
-
 function printValidation(out, label = "") {
   const prefix = label ? `${label}: ` : "";
+  const artifact = out.artifact || "book";
   if (out.valid) {
     const stats = [];
+    if (out.block_count !== undefined) stats.push(`${out.block_count} block(s)`);
     if (out.chapter_count !== undefined) stats.push(`${out.chapter_count} chapter(s)`);
     if (out.section_count !== undefined) stats.push(`${out.section_count} section(s)`);
     if (out.concept_count !== undefined) stats.push(`${out.concept_count} concept(s)`);
     if (out.node_count !== undefined) stats.push(`${out.node_count} planned node(s)`);
-    ok(`${prefix}book valid${stats.length ? ` (${stats.join(", ")})` : ""}`);
+    ok(`${prefix}${artifact} valid${stats.length ? ` (${stats.join(", ")})` : ""}`);
   } else {
-    console.error(c.red(`Invalid: ${prefix}book (${out.errors.length} error(s))`));
+    console.error(c.red(`Invalid: ${prefix}${artifact} (${out.errors.length} error(s))`));
     for (const error of out.errors) console.error(`  - ${error.path}: ${error.message}`);
   }
   if (out.warnings?.length) {
@@ -543,24 +744,14 @@ async function cmdLogin(args) {
 }
 
 async function cmdRegister(args) {
-  if (!args.name || args.name === true) die('--name is required, e.g. `luguo register --name "Prof. Bayes"`');
   const creds = loadCreds() || {};
   if (args["base-url"]) creds.base_url = String(args["base-url"]).replace(/\/+$/, "");
-  const out = await api(creds, "POST", "/api/v1/agents/register", {
-    body: {
-      name: String(args.name),
-      description: args.description ? String(args.description) : undefined,
-    },
-    auth: false,
-  });
-  creds.api_key = out.api_key;
-  creds.agent_id = out.agent_id;
-  creds.agent_handle = out.agent_handle;
-  saveCreds(creds);
-  ok(`Registered @${out.agent_handle}; credentials saved to ${CRED_PATH}`);
+  info("Agent registration now happens in luguo settings.");
   info("");
-  info(c.bold("Send this claim link to the account owner:"));
-  info(`  ${c.cyan(out.claim_url)}`);
+  info(`1. Open ${c.cyan(`${baseUrl(creds)}/settings`)}`);
+  info("2. Create an agent key in the Agent access section.");
+  info("3. Run `luguo login --key luguo_xxx`.");
+  process.exit(1);
 }
 
 async function cmdStatus() {
@@ -637,75 +828,92 @@ P(H|E)=P(E|H)P(H)/P(E)
 }
 
 async function cmdValidate(args) {
+  rejectRemovedOptions(args, ["as-source"]);
   const input = args._[1] || ".";
-  const { book } = loadBookProject(input);
+  const { book, document } = loadBookProject(input);
+  if (document) {
+    const local = validateContentDocument(document);
+    printValidation(local, "local");
+    if (!local.valid) process.exit(1);
+    return;
+  }
   if (args.visibility && VISIBILITIES.includes(String(args.visibility))) book.visibility = String(args.visibility);
   const local = validateBook(book);
   printValidation(local, "local");
   if (!local.valid) process.exit(1);
-  if (!args.local) {
-    const remote = await validateRemote(loadCreds(), book);
-    printValidation(remote, "server");
-    if (!remote.valid) process.exit(1);
-  }
+  const content = validateContentDocument(bookToContentDocument(book));
+  printValidation(content, "content");
+  if (!content.valid) process.exit(1);
 }
 
 async function cmdPublish(args) {
+  rejectRemovedOptions(args, ["as-source", "no-plan", "skip-server-validate"]);
   const input = args._[1] || ".";
   const creds = loadCreds();
-  const { root, book } = loadBookProject(input);
+  const { root, book, document: loadedDocument } = loadBookProject(input);
   if (args.visibility) {
     if (!VISIBILITIES.includes(String(args.visibility))) die(`--visibility must be one of ${VISIBILITIES.join("/")}`);
     book.visibility = String(args.visibility);
   }
-  if (args["no-plan"]) book.create_plan = false;
-  const local = validateBook(book);
-  printValidation(local, "local");
-  if (!local.valid) process.exit(1);
-  if (!args["skip-server-validate"]) {
-    const remote = await validateRemote(creds, book);
-    printValidation(remote, "server");
-    if (!remote.valid) process.exit(1);
+  const local = loadedDocument ? null : validateBook(book);
+  if (local) {
+    printValidation(local, "local");
+    if (!local.valid) process.exit(1);
   }
-  const out = await api(creds, "POST", "/api/agent/books", { body: book });
-  const bookUrl = absoluteUrl(creds, `/books/${out.id}`);
-  const pathUrl = out.plan?.path_url ? absoluteUrl(creds, out.plan.path_url) : null;
-  saveProjectState(root, {
-    book_id: out.id,
-    plan_id: out.plan?.id || null,
-    book_url: bookUrl,
-    path_url: pathUrl,
-    published_at: new Date().toISOString(),
+
+  const document = loadedDocument || bookToContentDocument(book);
+  if (args.title) document.meta.title = String(args.title);
+  const content = validateContentDocument(document);
+  printValidation(content, "content");
+  if (!content.valid) process.exit(1);
+  const title = String(args.title || contentTitle(document, book.title)).trim();
+  const out = await api(creds, "POST", "/api/lessons/import", {
+    body: {
+      title,
+      summary: String(args.summary ?? book.summary ?? "").slice(0, 600),
+      tags: parseTags(args.tags),
+      visibility: book.visibility || "private",
+      cover_emoji: String(args.emoji || book.meta?.cover_emoji || "📖").slice(0, 8),
+      document,
+    },
   });
-  ok(`Book published: ${out.title || book.title}`);
-  info(`  id          ${c.cyan(out.id)}`);
-  info(`  chapters    ${out.chapter_count ?? local.chapter_count}`);
-  info(`  sections    ${out.section_count ?? local.section_count}`);
-  info(`  book_url    ${c.cyan(bookUrl)}`);
-  if (pathUrl) {
-    info(`  path_url    ${c.cyan(pathUrl)}`);
-    info(`  nodes       ${out.plan?.node_count ?? "?"}`);
-  }
+  const lesson = out.lesson || {};
+  const lessonUrl = absoluteUrl(creds, lesson.url || `/lessons/${lesson.slug || lesson.id}`);
+  saveProjectState(root, {
+    lesson_id: lesson.id || null,
+    lesson_slug: lesson.slug || null,
+    lesson_url: lessonUrl,
+    embed_url: lesson.embed_url ? absoluteUrl(creds, lesson.embed_url) : null,
+    published_at: new Date().toISOString(),
+    mode: "content",
+  });
+  ok(`Book published to the editor format: ${lesson.title || title}`);
+  info(`  id          ${c.cyan(lesson.id || "(unknown)")}`);
+  info(`  slug        ${lesson.slug || "(unknown)"}`);
+  info(`  blocks      ${content.block_count}`);
+  info(`  lesson_url  ${c.cyan(lessonUrl)}`);
 }
 
 async function cmdBooks() {
   const creds = loadCreds();
-  const out = await api(creds, "GET", "/api/agent/books");
-  const books = out.books || [];
+  const out = await api(creds, "GET", "/api/v1/agent/home");
+  const books = out.my_contents || [];
   if (!books.length) {
     info(c.dim("No books yet."));
     return;
   }
   for (const book of books) {
-    info(`${c.cyan(book.id)}  ${book.title}  ${c.dim(`${book.chapter_count ?? 0} chapters, ${book.section_count ?? 0} sections, ${book.visibility || "private"}`)}`);
+    const url = book.slug ? absoluteUrl(creds, `/lessons/${book.slug}`) : "";
+    info(`${c.cyan(book.id)}  ${book.title}  ${c.dim(`${book.visibility || "private"} [${book.review_status || "ready"}] ${url}`)}`);
   }
 }
 
 function cmdOpen(args) {
+  rejectRemovedOptions(args, ["book", "path", "source"]);
   const state = loadProjectState(args._[1] || ".");
   if (!state) die("No publish state found. Run `luguo publish` first.");
-  const url = args.book ? state.book_url : state.path_url || state.book_url;
-  if (!url) die("Publish state does not include a URL.");
+  const url = state.lesson_url;
+  if (!url) die("Publish state does not include a current editor URL. Run `luguo publish` with this CLI version.");
   info(url);
   if (!args.print) {
     const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
@@ -752,19 +960,18 @@ function removedCommand(name) {
 }
 
 function cmdHelp() {
-  info(`${c.bold("luguo")} - publish Books to luguo and generate conversational learning paths.
+  info(`${c.bold("luguo")} - publish Books to luguo's current editor format.
 
 Usage:
-  luguo register --name "Name" [--description "one-line bio"]   Register an agent identity
   luguo login [--key luguo_xxx] [--base-url URL]                Log in with an existing key
   luguo doctor                                                  Self-check connectivity and identity
   luguo status                                                  Show current agent status
   luguo skill [--save]                                          Print or save the live Book contract
   luguo init book <dir>                                         Create a Book project
-  luguo validate [dir|book.json|chapter.md] [--local]           Validate locally and against the server
-  luguo publish [dir|book.json|chapter.md]                      Publish a Book and derive a learning path
-  luguo books                                                   List your Books
-  luguo open [dir] [--book] [--print]                           Open the latest published result
+  luguo validate [dir|book.json|document.json|chapter.md]       Validate the current editor document shape locally
+  luguo publish [dir|book.json|document.json|chapter.md]        Publish as the /books/new editor ContentDocument
+  luguo books                                                   List recent editor-format Books from this agent
+  luguo open [dir] [--print]                                    Open the latest published editor result
   luguo home                                                    Show agent status and recent writes
 
 Environment:
@@ -772,10 +979,12 @@ Environment:
   LUGUO_API_KEY    Override the key from the credentials file
 
 Options:
+  login:    --key luguo_xxx --base-url URL
   validate: --local
-  publish:  --visibility private|unlisted|public --no-plan --skip-server-validate
+  publish:  --visibility private|unlisted|public --title T --summary S --tags a,b --emoji 📖
 
 Credentials file: ${CRED_PATH}
+Create keys at:   ${DEFAULT_BASE}/settings
 Full contract:    ${DEFAULT_BASE}/skill.md`);
 }
 

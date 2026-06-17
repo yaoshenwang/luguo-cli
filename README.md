@@ -1,7 +1,8 @@
 # luguo-cli
 
-Publish Book projects to [luguo](https://luguo.ai). A Book is the authored
-source of truth; luguo derives learning paths and conversational lessons from it.
+Publish Book projects to [luguo](https://luguo.ai). By default, `publish`
+creates the same editor-compatible `ContentDocument` used by `/books/new`, so
+CLI output can be opened and edited in the current luguo editor.
 
 The CLI is dependency-free and runs on Node.js 18+.
 
@@ -20,7 +21,8 @@ npx luguo-cli@latest help
 ## Quick Start
 
 ```bash
-luguo register --name "My Agent"
+# Create an agent key at https://luguo.ai/settings first.
+luguo login --key luguo_xxx
 luguo init book my-book
 cd my-book
 luguo validate
@@ -28,7 +30,8 @@ luguo publish
 luguo open
 ```
 
-`register` prints a claim link. Send it to the luguo account owner.
+Use `--base-url` with `login` when you are testing against another luguo
+deployment.
 
 ## Book Project
 
@@ -66,29 +69,37 @@ If a spectrum has peaks at 440 Hz and 880 Hz, identify the fundamental and first
 
 ## JSON Book
 
-You can also publish a normalized JSON file:
+You can also publish a normalized JSON Book project:
 
 ```bash
 luguo validate examples/book.json
 luguo publish examples/book.json
 ```
 
+If you already have a `/books/new` editor JSON (`{ "version": "1", "blocks": ... }`),
+publish it directly:
+
+```bash
+luguo validate document.json
+luguo publish document.json --title "My Book"
+```
+
 ## Commands
 
 | Command | Purpose |
 | --- | --- |
-| `luguo register --name X` | Register an agent identity |
 | `luguo login [--key …] [--base-url …]` | Use an existing key |
 | `luguo doctor` / `luguo status` | Check connectivity and identity |
 | `luguo skill [--save]` | Print or save the live Book contract |
 | `luguo init book <dir>` | Create a Book project |
-| `luguo validate [dir\|book.json\|chapter.md]` | Validate locally and against the server |
-| `luguo publish [dir\|book.json\|chapter.md]` | Publish a Book and derive a learning path |
-| `luguo books` | List your Books |
-| `luguo open [dir] [--book] [--print]` | Open the latest published result |
+| `luguo validate [dir\|book.json\|document.json\|chapter.md]` | Validate a Book project or editor `ContentDocument` |
+| `luguo publish [dir\|book.json\|document.json\|chapter.md]` | Publish to the current editor-compatible document format |
+| `luguo books` | List recent editor-format Books |
+| `luguo open [dir] [--print]` | Open the latest published result |
 
-Removed commands such as `material create` and `plan create` now fail with a
-message pointing to the Book workflow.
+Removed commands and options such as `register`, `material create`,
+`plan create`, and `publish --as-source` now fail with a message pointing to the
+current editor workflow.
 
 ## Credentials
 

@@ -1,7 +1,7 @@
 {
   "name": "luguo-cli",
-  "version": "0.1.3",
-  "description": "Publish Book projects to luguo (炉果) and generate conversational learning paths.",
+  "version": "0.1.4",
+  "description": "Publish Book projects to luguo (炉果) in the current editor-compatible ContentDocument format.",
   "type": "module",
   "bin": {
     "luguo": "bin/luguo.mjs"
