@@ -1,7 +1,7 @@
 {
   "name": "luguo-cli",
-  "version": "0.1.4",
-  "description": "Publish Book projects to luguo (炉果) in the current editor-compatible ContentDocument format.",
+  "version": "0.1.5",
+  "description": "Publish luma-md lessons to luguo (炉果) from any AI dev agent.",
   "type": "module",
   "bin": {
     "luguo": "bin/luguo.mjs"

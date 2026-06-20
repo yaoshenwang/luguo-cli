@@ -4,6 +4,17 @@ All notable changes to `luguo-cli` are documented here. This project follows
 [Semantic Versioning](https://semver.org/) and the
 [Keep a Changelog](https://keepachangelog.com/) format.
 
+## [0.1.5] - 2026-06-20
+
+### Changed
+- **Switched to luma-md.** `publish` now sends a luma-md Markdown lesson to `POST /api/agent/lessons` — the same format the web editor stores — replacing the old `ContentDocument` block tree and the `/api/lessons/import` path.
+- A lesson is now one `.md` file with optional `---` frontmatter (`title` / `summary` / `tags` / `visibility` / `language` / `emoji`). `init [dir]` scaffolds `lesson.md` instead of a multi-chapter Book project.
+- `validate` lints luma-md locally, then verifies it server-side via `POST /api/agent/validate` (`artifact: "luma_md"`).
+- `lessons` replaces `books` (kept as an alias).
+
+### Removed
+- Removed the Book-project model (`luguo.yml`, multi-chapter directories), `ContentDocument` JSON publishing, and the local block-tree validators.
+
 ## [0.1.4] - 2026-06-17
 
 ### Changed
@@ -58,6 +69,7 @@ First public release.
 - Zero runtime dependencies (pure Node ≥ 18, using the global `fetch` and `node:` builtins).
 - Credentials stored at `~/.config/luguo/credentials.json` with `0600` permissions.
 
+[0.1.5]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.1...v0.1.2

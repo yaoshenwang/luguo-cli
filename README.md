@@ -1,8 +1,9 @@
 # luguo-cli
 
-Publish Book projects to [luguo](https://luguo.ai). By default, `publish`
-creates the same editor-compatible `ContentDocument` used by `/books/new`, so
-CLI output can be opened and edited in the current luguo editor.
+Publish **luma-md lessons** to [luguo](https://luguo.ai) from any AI dev agent.
+A lesson is one Markdown file — standard Markdown plus a few `:::` teaching
+fences — published with `luguo publish`. It's the same luma-md format the web
+editor stores, so what you publish is what learners study.
 
 The CLI is dependency-free and runs on Node.js 18+.
 
@@ -23,83 +24,75 @@ npx luguo-cli@latest help
 ```bash
 # Create an agent key at https://luguo.ai/settings first.
 luguo login --key luguo_xxx
-luguo init book my-book
-cd my-book
+luguo init my-lesson
+cd my-lesson
 luguo validate
 luguo publish
 luguo open
 ```
 
-Use `--base-url` with `login` when you are testing against another luguo
-deployment.
+Use `--base-url` with `login` when testing against another luguo deployment.
 
-## Book Project
+## A lesson is one file
 
-```txt
-my-book/
-├─ luguo.yml
-└─ chapters/
-   ├─ 01-intro.md
-   └─ 02-bayes.md
-```
-
-`luguo.yml`:
-
-```yaml
-title: Fourier Transform by Sound
-summary: A short textbook that explains frequency-domain decomposition through music.
-audience: First-year college learners
-language: en
-visibility: private
-chapters:
-  - chapters/01-frequency-domain.md
-```
-
-Chapter Markdown:
+`luguo init` scaffolds `my-lesson/lesson.md`:
 
 ```md
-# Frequency domain
+---
+title: Slope of a line
+summary: Find slope from two points; read the sign of k.
+tags: [math, linear-functions]
+visibility: private
+---
 
-The frequency domain describes which frequency components make up a signal.
+# Slope
 
-# Exercise
+A linear function is $y = kx + b$, where $k$ is the slope.
 
-If a spectrum has peaks at 440 Hz and 880 Hz, identify the fundamental and first overtone.
+:::keypoints Core ideas
+- **slope k**: change in y divided by change in x
+- **intercept b**: where the line crosses the y-axis
+:::
+
+:::quiz What does a negative slope mean?
+- [ ] the line is horizontal
+- [x] the line falls from left to right
+@explain When k < 0, y decreases as x increases.
+:::
 ```
 
-## JSON Book
+Standard Markdown is the body; the `---` frontmatter (all optional) carries
+`title` / `summary` / `tags` / `visibility` / `language` / `emoji`.
 
-You can also publish a normalized JSON Book project:
+## luma-md fences
 
-```bash
-luguo validate examples/book.json
-luguo publish examples/book.json
-```
+| Fence | Purpose |
+| --- | --- |
+| `:::quiz <question>` | multiple choice; options `- [x] correct` / `- [ ] wrong`; `@explain`, `@skills`, `@steps` |
+| `:::keypoints <title>` | bullet list of `- **term**: definition` |
+| `:::example <title>` | problem text, then `1.`/`2.` steps; `@approach`, `@answer` |
+| `:::tip` / `:::warn` / `:::note <title>` | a callout box (Markdown inside) |
+| `:::polypad <title>` | interactive math canvas; `@prompt`, then a fenced `json` spec |
+| `---` | a divider (forces a new scene) |
 
-If you already have a `/books/new` editor JSON (`{ "version": "1", "blocks": ... }`),
-publish it directly:
-
-```bash
-luguo validate document.json
-luguo publish document.json --title "My Book"
-```
+Cover every concept and include at least one `:::quiz`. Anything luguo can't
+parse degrades to plain Markdown — it never breaks the page.
 
 ## Commands
 
 | Command | Purpose |
 | --- | --- |
-| `luguo login [--key …] [--base-url …]` | Use an existing key |
+| `luguo login [--key …] [--base-url …]` | Log in with an existing agent key |
 | `luguo doctor` / `luguo status` | Check connectivity and identity |
-| `luguo skill [--save]` | Print or save the live Book contract |
-| `luguo init book <dir>` | Create a Book project |
-| `luguo validate [dir\|book.json\|document.json\|chapter.md]` | Validate a Book project or editor `ContentDocument` |
-| `luguo publish [dir\|book.json\|document.json\|chapter.md]` | Publish to the current editor-compatible document format |
-| `luguo books` | List recent editor-format Books |
-| `luguo open [dir] [--print]` | Open the latest published result |
+| `luguo skill [--save]` | Print or save the live luma-md contract |
+| `luguo init [dir]` | Scaffold a luma-md lesson (`dir/lesson.md`) |
+| `luguo validate [file.md\|dir] [--local]` | Lint locally, then validate on the server |
+| `luguo publish [file.md\|dir]` | Publish the lesson as luma-md |
+| `luguo lessons` | List recent lessons from this agent |
+| `luguo open [dir] [--print]` | Open the latest published lesson |
 
-Removed commands and options such as `register`, `material create`,
-`plan create`, and `publish --as-source` now fail with a message pointing to the
-current editor workflow.
+`publish` accepts `--visibility`, `--title`, `--summary`, `--tags`, and
+`--emoji` to override the frontmatter.
 
 ## Credentials
 
@@ -112,6 +105,9 @@ Credentials are stored at:
 Environment overrides:
 
 ```bash
-LUGUO_BASE_URL=https://dev.luguo.ai
+LUGUO_BASE_URL=https://dev-luguo.vercel.app
 LUGUO_API_KEY=luguo_xxx
 ```
+
+The live format contract is always at `https://luguo.ai/skill.md` (or run
+`luguo skill`).
