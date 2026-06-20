@@ -1,6 +1,6 @@
 {
   "name": "luguo-cli",
-  "version": "0.1.5",
+  "version": "0.1.5-beta.0",
   "description": "Publish luma-md lessons to luguo (炉果) from any AI dev agent.",
   "type": "module",
   "bin": {

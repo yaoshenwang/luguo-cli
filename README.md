@@ -31,7 +31,15 @@ luguo publish
 luguo open
 ```
 
-Use `--base-url` with `login` when testing against another luguo deployment.
+`login` binds the CLI to one site and remembers it: use `--env dev` (or
+`--base-url <url>`) to target the dev preview, `--env prod` for production (the
+default). To try the in-development build before it becomes the public release,
+install from the `beta` channel — `@latest` stays the stable release:
+
+```bash
+npm i -g luguo-cli@beta
+luguo login --key luguo_xxx --env dev
+```
 
 ## A lesson is one file
 

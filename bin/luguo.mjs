@@ -26,6 +26,15 @@ const STATE_DIR = ".luguo";
 const STATE_FILE = "state.json";
 const LUMA_FORMAT = "luma-md-v1";
 const VISIBILITIES = ["private", "public", "unlisted"];
+// Named sites the CLI can bind to. `login` persists the chosen base into the
+// credentials file, so every later command targets that same site — the CLI is
+// bound to whichever site you logged into (dev key -> dev, prod key -> prod).
+const ENVS = {
+  dev: "https://dev-luguo.vercel.app",
+  prod: "https://luguo.ai",
+  production: "https://luguo.ai",
+  local: "http://localhost:3000",
+};
 const LUMA_DIRECTIVES = new Set(["quiz", "keypoints", "example", "tip", "warn", "note", "polypad"]);
 
 const c = {
@@ -282,6 +291,11 @@ function reportServerValidation(out) {
 
 async function cmdLogin(args) {
   const creds = loadCreds() || {};
+  if (args.env) {
+    const url = ENVS[String(args.env).toLowerCase()];
+    if (!url) die(`Unknown --env "${args.env}". Use one of: ${Object.keys(ENVS).join(", ")}, or --base-url <url>.`);
+    creds.base_url = url;
+  }
   if (args["base-url"]) creds.base_url = String(args["base-url"]).replace(/\/+$/, "");
   let key = typeof args.key === "string" ? args.key : null;
   if (!key) key = await readStdinMaybe();
@@ -297,7 +311,7 @@ async function cmdLogin(args) {
   creds.agent_handle = status.handle || creds.agent_handle;
   saveCreds(creds);
   ok(`Logged in as @${creds.agent_handle || "agent"}`);
-  info(c.dim(`Credentials saved to ${CRED_PATH}`));
+  info(c.dim(`Bound to ${baseUrl(creds)} · credentials at ${CRED_PATH}`));
 }
 
 async function cmdRegister(args) {
@@ -519,7 +533,7 @@ function cmdHelp() {
   info(`${c.bold("luguo")} - publish luma-md lessons to luguo.
 
 Usage:
-  luguo login [--key luguo_xxx] [--base-url URL]   Log in with an existing agent key
+  luguo login [--key luguo_xxx] [--env dev|prod] [--base-url URL]   Log in (binds the CLI to that site)
   luguo doctor                                     Self-check connectivity and identity
   luguo status                                     Show current agent status
   luguo skill [--save]                             Print or save the live luma-md contract
@@ -539,7 +553,7 @@ Environment:
   LUGUO_API_KEY    Override the key from the credentials file
 
 Options:
-  login:    --key luguo_xxx --base-url URL
+  login:    --key luguo_xxx --env dev|prod|local --base-url URL
   validate: --local
   publish:  --visibility private|unlisted|public --title T --summary S --tags a,b --emoji 📖
 

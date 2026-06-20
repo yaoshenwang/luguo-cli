@@ -30,7 +30,14 @@ luguo publish
 luguo open
 ```
 
-测试其他炉果部署时，在 `login` 后加 `--base-url`。
+`login` 会把 CLI 绑定到一个站点并记住它：用 `--env dev`（或 `--base-url <url>`）
+指向 dev 预览，`--env prod` 指向生产（默认）。要在新版成为正式发布前先测，从
+`beta` 通道安装（`@latest` 仍是稳定版）：
+
+```bash
+npm i -g luguo-cli@beta
+luguo login --key luguo_xxx --env dev
+```
 
 ## 一节课就是一个文件
 

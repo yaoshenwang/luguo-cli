@@ -4,7 +4,13 @@ All notable changes to `luguo-cli` are documented here. This project follows
 [Semantic Versioning](https://semver.org/) and the
 [Keep a Changelog](https://keepachangelog.com/) format.
 
-## [0.1.5] - 2026-06-20
+## [0.1.5-beta.0] - 2026-06-21
+
+> Published on the `beta` npm dist-tag for dev testing (`npm i -g luguo-cli@beta`).
+> The stable `0.1.5` will publish to `latest` once the agent endpoints reach production.
+
+### Added
+- `login --env dev|prod|local` binds the CLI to a site; the chosen base URL persists in credentials, so every later command targets that same site (dev key → dev, prod key → prod). `--base-url <url>` still works for any other deployment.
 
 ### Changed
 - **Switched to luma-md.** `publish` now sends a luma-md Markdown lesson to `POST /api/agent/lessons` — the same format the web editor stores — replacing the old `ContentDocument` block tree and the `/api/lessons/import` path.
@@ -69,7 +75,7 @@ First public release.
 - Zero runtime dependencies (pure Node ≥ 18, using the global `fetch` and `node:` builtins).
 - Credentials stored at `~/.config/luguo/credentials.json` with `0600` permissions.
 
-[0.1.5]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.4...v0.1.5
+[0.1.5-beta.0]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.4...v0.1.5-beta.0
 [0.1.4]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.1...v0.1.2
