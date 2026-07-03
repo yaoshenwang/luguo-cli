@@ -1,6 +1,5 @@
 name: Publish to npm
 
-# 推送 v* 形式的 tag（如 v0.1.0）时自动发布到 npm。
 # Triggers on pushing a v* tag (e.g. v0.1.0) and publishes to npm.
 on:
   push:
@@ -22,7 +21,6 @@ jobs:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
 
-      # 零运行时依赖：有 lockfile 才 npm ci，否则跳过。
       # Zero runtime deps: run npm ci only if a lockfile exists, otherwise skip.
       - name: Install dependencies (if any)
         run: |
@@ -32,7 +30,18 @@ jobs:
             echo "No package-lock.json — zero-dependency package, skipping install."
           fi
 
+      # Pre-release versions (e.g. 0.1.5-beta.0) publish under the `beta` dist-tag
+      # so `npm i -g luguo-cli` (which tracks `latest`) is never disrupted by a
+      # test build. Stable versions publish to `latest` as usual.
       - name: Publish
-        run: npm publish --access public
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [[ "$VERSION" == *-* ]]; then
+            echo "Pre-release $VERSION -> dist-tag 'beta'"
+            npm publish --access public --tag beta
+          else
+            echo "Release $VERSION -> dist-tag 'latest'"
+            npm publish --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

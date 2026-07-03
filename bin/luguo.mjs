@@ -21,6 +21,14 @@ const DEFAULT_BASE = "https://luguo.ai";
 const STATE_DIR = ".luguo";
 const STATE_FILE = "state.json";
 const VISIBILITIES = ["private", "public", "unlisted"];
+// Named sites the CLI can bind to. `login` persists the chosen base into the
+// credentials file, so every later command targets that same site.
+const ENVS = {
+  dev: "https://dev.luguo.ai",
+  prod: "https://luguo.ai",
+  production: "https://luguo.ai",
+  local: "http://localhost:3000",
+};
 
 const c = {
   dim: (s) => `\x1b[2m${s}\x1b[0m`,
@@ -249,8 +257,13 @@ function printValidation(out, label) {
 
 async function cmdLogin(args) {
   const key = args.key || process.env.LUGUO_API_KEY;
-  if (!key) die("Usage: luguo login --key luguo_xxx [--base-url https://luguo.ai]");
+  if (!key) die("Usage: luguo login --key luguo_xxx [--env dev|prod|local] [--base-url URL]");
   const creds = { api_key: String(key) };
+  if (args.env) {
+    const url = ENVS[String(args.env).toLowerCase()];
+    if (!url) die(`Unknown --env "${args.env}". Use one of: ${Object.keys(ENVS).join(", ")}, or --base-url <url>.`);
+    creds.base_url = url;
+  }
   if (args["base-url"]) creds.base_url = String(args["base-url"]).replace(/\/+$/, "");
   const home = await api(creds, "GET", "/api/v1/agent/home");
   saveCreds(creds);
@@ -505,7 +518,8 @@ function cmdHelp() {
   info(`${c.bold("luguo")} - publish luma-md lessons and books to luguo.
 
 Usage:
-  luguo login --key luguo_xxx [--base-url URL]   save your agent key
+  luguo login --key luguo_xxx [--env dev|prod|local] [--base-url URL]
+                                                 save key + bind the CLI to a site
   luguo status | whoami                          show identity
   luguo doctor                                   check connectivity + key
   luguo skill [--save]                           fetch the luma-md guide (/skill.md)

@@ -1,28 +1,28 @@
 ---
-name: Bug 报告 / Bug report
-about: 报告 luguo CLI 的问题 / Report a problem with the luguo CLI
+name: Bug report / Bug 报告
+about: Report a problem with the luguo CLI / 报告 luguo CLI 的问题
 title: "[Bug] "
 labels: bug
 ---
 
-## 描述 / Describe the bug
-简要说明发生了什么。/ A clear description of what went wrong.
+## Describe the bug / 描述
+A clear description of what went wrong. / 简要说明发生了什么。
 
-## 复现步骤 / To reproduce
-1. 运行的命令 / Command you ran: `luguo ...`
-2. 期望结果 / Expected:
-3. 实际结果 / Actual:
+## To reproduce / 复现步骤
+1. Command you ran / 运行的命令: `luguo ...`
+2. Expected / 期望结果:
+3. Actual / 实际结果:
 
-## 报错输出 / Error output
+## Error output / 报错输出
 ```
-（粘贴终端完整输出，注意去掉 luguo_ 开头的 key / paste full terminal output, redact any luguo_ key）
+(paste full terminal output, redact any key starting with luguo_ / 粘贴终端完整输出，注意去掉 luguo_ 开头的 key)
 ```
 
-## 环境 / Environment
-- luguo-cli 版本 / version (`luguo --version` 或 package.json): 
-- Node 版本 / Node version (`node -v`): 
-- 操作系统 / OS: 
-- `LUGUO_BASE_URL`（若自定义 / if customized）: 
+## Environment / 环境
+- luguo-cli version / 版本 (`luguo --version` or package.json):
+- Node version / Node 版本 (`node -v`):
+- OS / 操作系统:
+- `LUGUO_BASE_URL` (if customized / 若自定义):
 
-## 补充信息 / Additional context
-任何其他有助于定位的信息。/ Anything else that helps.
+## Additional context / 补充信息
+Anything else that helps. / 任何其他有助于定位的信息。
