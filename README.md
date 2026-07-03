@@ -1,90 +1,117 @@
 # luguo-cli
 
-[![npm version](https://img.shields.io/npm/v/luguo-cli.svg)](https://www.npmjs.com/package/luguo-cli)
-[![license](https://img.shields.io/npm/l/luguo-cli.svg)](./LICENSE)
+Publish Book projects to [luguo](https://luguo.ai). By default, `publish`
+creates the same editor-compatible `ContentDocument` used by `/books/new`, so
+CLI output can be opened and edited in the current luguo editor.
 
-用你**自己的 AI**（Claude Code、Codex、或任何脚本）给 [炉果 luguo](https://luguo.ai) 生产学习内容。你出模型和 token，炉果负责存储、渲染和游戏化。
+The CLI is dependency-free and runs on Node.js 18+.
 
-> 用 luguo CLI 时遇到问题，或有功能建议？欢迎到 [Issues](https://github.com/yaoshenwang/luguo-cli/issues) 提（中英文都行）。
-
-## 安装
-
-```bash
-npm i -g luguo-cli      # 或免安装：npx luguo-cli <命令>
-```
-
-需要 Node ≥ 18。
-
-## 30 秒上手
+## Install
 
 ```bash
-luguo register --name "傅里叶老师"          # 注册 agent 身份，拿到 luguo_ key（自动存好）
-luguo doctor                               # 自检连通性 + 身份
-luguo create --topic "用音乐解释傅里叶变换"  # 让炉果用平台模型生成（不耗你的 token）
+npm i -g luguo-cli
 ```
 
-`register` 会给你一个**认领链接**；在 luguo 网页登录后点 Claim，这个 agent 就归到你账号名下（内容从“待审”变“直接发布”，配额拉满）。
-
-## 两种生产方式
-
-### A. 自带成品（你的模型生成，炉果纯存储）— 推荐给 Claude Code / Codex
-
-让你的 Agent 产出一份 **ContentDocument**（block 树，见下），然后：
+Or run without installing:
 
 ```bash
-luguo validate lesson.json                 # 先用线上 schema 自检
-luguo create --raw lesson.json --tags 数学,信号
+npx luguo-cli@latest help
 ```
 
-这条路**完全不调用炉果的模型**——零平台成本、零延迟、归属你的 agent。
-
-### B. 让平台生成（省事，用炉果的模型）
+## Quick Start
 
 ```bash
-luguo create --topic "..."         # 一句话主题
-luguo create --outline outline.md  # 你写大纲，平台扩写
-luguo create --paste long.md       # 长文/讲义转成 block 树
+# Create an agent key at https://luguo.ai/settings first.
+luguo login --key luguo_xxx
+luguo init book my-book
+cd my-book
+luguo validate
+luguo publish
+luguo open
 ```
 
-## 在 Claude Code / Codex 里用
+Use `--base-url` with `login` when you are testing against another luguo
+deployment.
 
-把这段加进你的项目说明（CLAUDE.md / AGENTS.md），你的 Agent 就会用炉果发布：
+## Book Project
 
-> 需要发布学习内容到炉果时：先 `luguo skill` 读契约，用自己的模型产出符合 ContentDocument schema 的 JSON，`luguo validate <file>` 自检，再 `luguo create --raw <file>`。完整契约见 https://luguo.ai/skill.md 。
-
-## ContentDocument 最小示例
-
-```json
-{
-  "version": "1",
-  "meta": { "title": "傅里叶变换：从音乐到信号", "language": "zh" },
-  "blocks": [
-    { "id": "intro001", "type": "text", "source": { "md": "每段声音都能拆成纯音的叠加。" } },
-    { "id": "head0001", "type": "heading", "source": { "level": 2, "md": "核心思想" } },
-    { "id": "eq000001", "type": "equation", "source": { "latex": "f(t)=\\sum a_n\\cos(n\\omega t)", "display": true } },
-    { "id": "ex000001", "type": "exercise", "source": { "q": "傅里叶把信号分解到什么域？", "choices": ["时域", "频域"], "answer": "频域", "explain": "傅里叶变换把时域信号映射到频域。" } }
-  ]
-}
+```txt
+my-book/
+├─ luguo.yml
+└─ chapters/
+   ├─ 01-intro.md
+   └─ 02-bayes.md
 ```
 
-block 类型：`text / heading / figure / equation / code / exercise / interactive / container`。每个 `exercise` 必须有 `answer`。完整规则用 `luguo skill` 查看。
+`luguo.yml`:
 
-## 命令速查
+```yaml
+title: Fourier Transform by Sound
+summary: A short textbook that explains frequency-domain decomposition through music.
+audience: First-year college learners
+language: en
+visibility: private
+chapters:
+  - chapters/01-frequency-domain.md
+```
 
-| 命令 | 作用 |
-|---|---|
-| `luguo register --name X` | 注册 agent，拿 key |
-| `luguo login [--key …] [--base-url …]` | 用已有 key 登录 |
-| `luguo doctor` / `luguo status` | 自检 / 看状态 |
-| `luguo validate <file>` | 校验 ContentDocument |
-| `luguo create --raw\|--topic\|--outline\|--paste` | 发布内容 |
-| `luguo home` | 看播放 / 反馈 / 话题缺口 |
-| `luguo skill [--save]` | 打印完整契约文档 |
+Chapter Markdown:
 
-## 配置
+```md
+# Frequency domain
 
-- 凭证存 `~/.config/luguo/credentials.json`（权限 600）。
-- `LUGUO_BASE_URL` 覆盖服务地址（dev 用 `https://dev.luguo.ai`）。
-- `LUGUO_API_KEY` 覆盖凭证里的 key。
+The frequency domain describes which frequency components make up a signal.
 
-凭证里的 `api_key` 是你的身份，产出都挂在你的 agent handle 名下——请勿外泄。
+# Exercise
+
+If a spectrum has peaks at 440 Hz and 880 Hz, identify the fundamental and first overtone.
+```
+
+## JSON Book
+
+You can also publish a normalized JSON Book project:
+
+```bash
+luguo validate examples/book.json
+luguo publish examples/book.json
+```
+
+If you already have a `/books/new` editor JSON (`{ "version": "1", "blocks": ... }`),
+publish it directly:
+
+```bash
+luguo validate document.json
+luguo publish document.json --title "My Book"
+```
+
+## Commands
+
+| Command | Purpose |
+| --- | --- |
+| `luguo login [--key …] [--base-url …]` | Use an existing key |
+| `luguo doctor` / `luguo status` | Check connectivity and identity |
+| `luguo skill [--save]` | Print or save the live Book contract |
+| `luguo init book <dir>` | Create a Book project |
+| `luguo validate [dir\|book.json\|document.json\|chapter.md]` | Validate a Book project or editor `ContentDocument` |
+| `luguo publish [dir\|book.json\|document.json\|chapter.md]` | Publish to the current editor-compatible document format |
+| `luguo books` | List recent editor-format Books |
+| `luguo open [dir] [--print]` | Open the latest published result |
+
+Removed commands and options such as `register`, `material create`,
+`plan create`, and `publish --as-source` now fail with a message pointing to the
+current editor workflow.
+
+## Credentials
+
+Credentials are stored at:
+
+```txt
+~/.config/luguo/credentials.json
+```
+
+Environment overrides:
+
+```bash
+LUGUO_BASE_URL=https://dev.luguo.ai
+LUGUO_API_KEY=luguo_xxx
+```

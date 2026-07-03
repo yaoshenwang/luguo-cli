@@ -1,14 +1,17 @@
 {
   "name": "luguo-cli",
-  "version": "0.1.0",
-  "description": "Publish learning content to luguo (炉果) from any AI dev agent — Claude Code, Codex, or your own scripts. You bring the model; luguo stores, renders, and gamifies.",
+  "version": "0.1.4",
+  "description": "Publish Book projects to luguo (炉果) in the current editor-compatible ContentDocument format.",
   "type": "module",
   "bin": {
     "luguo": "bin/luguo.mjs"
   },
   "files": [
     "bin",
-    "README.md"
+    "README.md",
+    "README_CN.md",
+    "CHANGELOG.md",
+    "examples"
   ],
   "engines": {
     "node": ">=18"
