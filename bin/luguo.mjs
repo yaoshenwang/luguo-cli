@@ -1,5 +1,8 @@
 #!/usr/bin/env node
-// luguo-cli - publish Book projects to luguo.
+// luguo-cli - publish luma-md lessons and books to luguo.
+// luma-md is the only content format: plain Markdown plus ::: teaching fences.
+// A single .md file publishes as one lesson (POST /api/agent/lessons);
+// a directory of .md chapters publishes as one book (POST /api/books + chapters).
 
 import { spawn } from "node:child_process";
 import {
@@ -11,14 +14,13 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, extname, join, relative, resolve } from "node:path";
-import { createInterface } from "node:readline/promises";
-import { stdin, stdout } from "node:process";
+import { basename, dirname, extname, join, resolve } from "node:path";
 
 const CRED_PATH = join(homedir(), ".config", "luguo", "credentials.json");
 const DEFAULT_BASE = "https://luguo.ai";
 const STATE_DIR = ".luguo";
 const STATE_FILE = "state.json";
+const VISIBILITIES = ["private", "public", "unlisted"];
 
 const c = {
   dim: (s) => `\x1b[2m${s}\x1b[0m`,
@@ -85,13 +87,6 @@ function requireKey(creds) {
   return key;
 }
 
-async function readStdinMaybe() {
-  if (stdin.isTTY) return null;
-  let data = "";
-  for await (const chunk of stdin) data += chunk;
-  return data.trim() || null;
-}
-
 async function api(creds, method, path, { body, auth = true } = {}) {
   const headers = { "content-type": "application/json" };
   if (auth) headers.authorization = `Bearer ${requireKey(creds)}`;
@@ -116,576 +111,107 @@ async function api(creds, method, path, { body, auth = true } = {}) {
   return json;
 }
 
-function rejectRemovedOptions(args, optionNames) {
-  for (const name of optionNames) {
-    if (args[name] !== undefined) {
-      die(`--${name} was removed. luguo-cli now publishes only the current editor ContentDocument format.`);
-    }
-  }
-}
-
-const VISIBILITIES = ["private", "public", "unlisted"];
-const BOOK_KINDS = ["cli", "manual", "upload", "official", "generated"];
-const BOOK_STATUSES = ["draft", "ready", "archived"];
-const CONTENT_BLOCK_TYPES = [
-  "text",
-  "heading",
-  "figure",
-  "equation",
-  "code",
-  "exercise",
-  "interactive",
-  "container",
-  "keypoints",
-  "worked_example",
-];
-
-const isPlainObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
-
-function result(errors, warnings, stats = {}) {
-  return { artifact: "book", valid: errors.length === 0, errors, warnings, ...stats };
-}
-
-function checkUnknown(errors, object, allowed, prefix = "") {
-  for (const key of Object.keys(object)) {
-    if (!allowed.has(key)) errors.push({ path: prefix ? `${prefix}.${key}` : key, message: "unknown field" });
-  }
-}
-
-function checkString(errors, path, value, message, { optional = false, min = 1, max = Infinity } = {}) {
-  if (optional && (value === undefined || value === null || value === "")) return;
-  if (typeof value !== "string") {
-    errors.push({ path, message });
-    return;
-  }
-  const len = value.trim().length;
-  if (len < min) errors.push({ path, message });
-  if (len > max) errors.push({ path, message: `must be at most ${max} characters` });
-}
-
-function checkStringArray(errors, path, value, { optional = true } = {}) {
-  if (value === undefined && optional) return;
-  if (!Array.isArray(value) || value.some((x) => typeof x !== "string")) {
-    errors.push({ path, message: "must be an array of strings" });
-  }
-}
-
-function validateBook(book) {
-  const errors = [];
-  const warnings = [];
-  if (!isPlainObject(book)) {
-    errors.push({ path: "(root)", message: "book must be a JSON object" });
-    return result(errors, warnings, { chapter_count: 0, section_count: 0 });
-  }
-
-  checkUnknown(
-    errors,
-    book,
-    new Set([
-      "title",
-      "subtitle",
-      "summary",
-      "book_kind",
-      "audience",
-      "language",
-      "license",
-      "source_refs",
-      "chapters",
-      "concepts",
-      "status",
-      "visibility",
-      "quality",
-      "meta",
-    ])
-  );
-  checkString(errors, "title", book.title, "must be a non-empty string", { max: 160 });
-  checkString(errors, "subtitle", book.subtitle, "must be a string", { optional: true, max: 160 });
-  checkString(errors, "summary", book.summary, "must be a string", { optional: true });
-  checkString(errors, "audience", book.audience, "must be a string", { optional: true, max: 160 });
-  checkString(errors, "language", book.language, "must be a language string", { optional: true, min: 2, max: 16 });
-  checkString(errors, "license", book.license, "must be a string", { optional: true, max: 80 });
-  if (book.book_kind !== undefined && !BOOK_KINDS.includes(book.book_kind)) errors.push({ path: "book_kind", message: `must be one of ${BOOK_KINDS.join("/")}` });
-  if (book.status !== undefined && !BOOK_STATUSES.includes(book.status)) errors.push({ path: "status", message: `must be one of ${BOOK_STATUSES.join("/")}` });
-  if (book.visibility !== undefined && !VISIBILITIES.includes(book.visibility)) errors.push({ path: "visibility", message: `must be one of ${VISIBILITIES.join("/")}` });
-  if (book.source_refs !== undefined && !Array.isArray(book.source_refs)) errors.push({ path: "source_refs", message: "must be an array" });
-  if (book.quality !== undefined && !isPlainObject(book.quality)) errors.push({ path: "quality", message: "must be an object" });
-  if (book.meta !== undefined && !isPlainObject(book.meta)) errors.push({ path: "meta", message: "must be an object" });
-
-  const sectionIds = new Set();
-  let sectionCount = 0;
-  if (!Array.isArray(book.chapters) || book.chapters.length === 0) {
-    errors.push({ path: "chapters", message: "must be a non-empty array" });
-  } else {
-    book.chapters.forEach((chapter, chapterIndex) => {
-      const chapterPath = `chapters[${chapterIndex}]`;
-      if (!isPlainObject(chapter)) {
-        errors.push({ path: chapterPath, message: "chapter must be an object" });
-        return;
-      }
-      checkUnknown(errors, chapter, new Set(["id", "title", "summary", "source_path", "sections", "meta"]), chapterPath);
-      checkString(errors, `${chapterPath}.id`, chapter.id, "missing string id");
-      checkString(errors, `${chapterPath}.title`, chapter.title, "must be a non-empty string");
-      checkString(errors, `${chapterPath}.summary`, chapter.summary, "must be a string", { optional: true });
-      checkString(errors, `${chapterPath}.source_path`, chapter.source_path, "must be a string", { optional: true });
-      if (!Array.isArray(chapter.sections) || chapter.sections.length === 0) {
-        errors.push({ path: `${chapterPath}.sections`, message: "must be a non-empty array" });
-      } else {
-        chapter.sections.forEach((section, sectionIndex) => {
-          const path = `${chapterPath}.sections[${sectionIndex}]`;
-          sectionCount += 1;
-          if (!isPlainObject(section)) {
-            errors.push({ path, message: "section must be an object" });
-            return;
-          }
-          checkUnknown(errors, section, new Set(["id", "title", "summary", "markdown", "source_path", "meta"]), path);
-          checkString(errors, `${path}.id`, section.id, "missing string id");
-          if (typeof section.id === "string") {
-            if (sectionIds.has(section.id)) errors.push({ path: `${path}.id`, message: `duplicate id "${section.id}"` });
-            sectionIds.add(section.id);
-          }
-          checkString(errors, `${path}.title`, section.title, "must be a non-empty string");
-          checkString(errors, `${path}.summary`, section.summary, "must be a string", { optional: true });
-          checkString(errors, `${path}.markdown`, section.markdown, "must be a non-empty string");
-          checkString(errors, `${path}.source_path`, section.source_path, "must be a string", { optional: true });
-          if (section.meta !== undefined && !isPlainObject(section.meta)) errors.push({ path: `${path}.meta`, message: "must be an object" });
-        });
-      }
-      if (chapter.meta !== undefined && !isPlainObject(chapter.meta)) errors.push({ path: `${chapterPath}.meta`, message: "must be an object" });
-    });
-  }
-
-  if (book.concepts !== undefined && !Array.isArray(book.concepts)) {
-    errors.push({ path: "concepts", message: "must be an array" });
-  } else {
-    for (const [index, concept] of (book.concepts || []).entries()) {
-      const path = `concepts[${index}]`;
-      if (!isPlainObject(concept)) {
-        errors.push({ path, message: "concept must be an object" });
-        continue;
-      }
-      checkUnknown(errors, concept, new Set(["id", "name", "summary", "source_section_ids", "meta"]), path);
-      checkString(errors, `${path}.id`, concept.id, "missing string id");
-      checkString(errors, `${path}.name`, concept.name, "must be a non-empty string");
-      checkString(errors, `${path}.summary`, concept.summary, "must be a string", { optional: true });
-      checkStringArray(errors, `${path}.source_section_ids`, concept.source_section_ids);
-      for (const sectionId of concept.source_section_ids || []) {
-        if (!sectionIds.has(sectionId)) warnings.push({ path: `${path}.source_section_ids`, message: `unknown section id "${sectionId}"` });
-      }
-      if (concept.meta !== undefined && !isPlainObject(concept.meta)) errors.push({ path: `${path}.meta`, message: "must be an object" });
-    }
-  }
-
-  return result(errors, warnings, {
-    chapter_count: Array.isArray(book.chapters) ? book.chapters.length : 0,
-    section_count: sectionCount,
-    concept_count: Array.isArray(book.concepts) ? book.concepts.length : 0,
-  });
-}
-
-function contentResult(errors, warnings, stats = {}) {
-  return { artifact: "content", valid: errors.length === 0, errors, warnings, ...stats };
-}
-
-function isContentDocument(value) {
-  return isPlainObject(value) && value.version === "1" && Array.isArray(value.blocks) && isPlainObject(value.meta);
-}
-
-function validateBlock(block, path, ids, errors) {
-  if (!isPlainObject(block)) {
-    errors.push({ path, message: "block must be an object" });
-    return 0;
-  }
-  checkUnknown(errors, block, new Set(["id", "type", "source", "meta", "children"]), path);
-  checkString(errors, `${path}.id`, block.id, "missing string id");
-  if (typeof block.id === "string") {
-    if (ids.has(block.id)) errors.push({ path: `${path}.id`, message: `duplicate id "${block.id}"` });
-    ids.add(block.id);
-  }
-  if (!CONTENT_BLOCK_TYPES.includes(block.type)) {
-    errors.push({ path: `${path}.type`, message: `must be one of ${CONTENT_BLOCK_TYPES.join("/")}` });
-    return 1;
-  }
-  if (!isPlainObject(block.source)) {
-    errors.push({ path: `${path}.source`, message: "source must be an object" });
-    return 1;
-  }
-  switch (block.type) {
-    case "text":
-      checkUnknown(errors, block.source, new Set(["md"]), `${path}.source`);
-      checkString(errors, `${path}.source.md`, block.source.md, "must be a string", { min: 0 });
-      break;
-    case "heading":
-      checkUnknown(errors, block.source, new Set(["level", "md"]), `${path}.source`);
-      if (!Number.isInteger(block.source.level) || block.source.level < 1 || block.source.level > 6) {
-        errors.push({ path: `${path}.source.level`, message: "must be an integer from 1 to 6" });
-      }
-      checkString(errors, `${path}.source.md`, block.source.md, "must be a string", { min: 0 });
-      break;
-    case "figure":
-      checkUnknown(errors, block.source, new Set(["url", "prompt", "alt", "caption"]), `${path}.source`);
-      checkString(errors, `${path}.source.url`, block.source.url, "must be a URL string", { optional: true });
-      checkString(errors, `${path}.source.prompt`, block.source.prompt, "must be a string", { optional: true });
-      checkString(errors, `${path}.source.alt`, block.source.alt, "must be a string", { optional: true });
-      checkString(errors, `${path}.source.caption`, block.source.caption, "must be a string", { optional: true });
-      break;
-    case "equation":
-      checkUnknown(errors, block.source, new Set(["latex", "display"]), `${path}.source`);
-      checkString(errors, `${path}.source.latex`, block.source.latex, "must be a string", { min: 0 });
-      if (block.source.display !== undefined && typeof block.source.display !== "boolean") {
-        errors.push({ path: `${path}.source.display`, message: "must be a boolean" });
-      }
-      break;
-    case "code":
-      checkUnknown(errors, block.source, new Set(["lang", "src", "runnable"]), `${path}.source`);
-      checkString(errors, `${path}.source.lang`, block.source.lang, "must be a string", { min: 0 });
-      checkString(errors, `${path}.source.src`, block.source.src, "must be a string", { min: 0 });
-      if (block.source.runnable !== undefined && typeof block.source.runnable !== "boolean") {
-        errors.push({ path: `${path}.source.runnable`, message: "must be a boolean" });
-      }
-      break;
-    case "exercise":
-      checkUnknown(errors, block.source, new Set(["q", "choices", "answer", "explain", "skills", "steps"]), `${path}.source`);
-      checkString(errors, `${path}.source.q`, block.source.q, "must be a string", { min: 0 });
-      checkString(errors, `${path}.source.answer`, block.source.answer, "must be a string", { min: 0 });
-      checkString(errors, `${path}.source.explain`, block.source.explain, "must be a string", { optional: true, min: 0 });
-      checkStringArray(errors, `${path}.source.choices`, block.source.choices);
-      checkStringArray(errors, `${path}.source.skills`, block.source.skills);
-      checkStringArray(errors, `${path}.source.steps`, block.source.steps);
-      break;
-    case "interactive":
-      checkUnknown(errors, block.source, new Set(["kind", "spec"]), `${path}.source`);
-      checkString(errors, `${path}.source.kind`, block.source.kind, "must be a non-empty string");
-      if (!isPlainObject(block.source.spec)) errors.push({ path: `${path}.source.spec`, message: "must be an object" });
-      break;
-    case "container":
-      checkUnknown(errors, block.source, new Set(["kind", "title", "tone"]), `${path}.source`);
-      if (block.source.kind !== undefined && !["callout", "quote", "section", "group"].includes(block.source.kind)) {
-        errors.push({ path: `${path}.source.kind`, message: "must be callout/quote/section/group" });
-      }
-      checkString(errors, `${path}.source.title`, block.source.title, "must be a string", { optional: true });
-      break;
-    case "keypoints":
-      checkUnknown(errors, block.source, new Set(["title", "points"]), `${path}.source`);
-      checkString(errors, `${path}.source.title`, block.source.title, "must be a string", { optional: true });
-      if (!Array.isArray(block.source.points) || block.source.points.length === 0) {
-        errors.push({ path: `${path}.source.points`, message: "must be a non-empty array" });
-      } else {
-        block.source.points.forEach((point, index) => {
-          const p = `${path}.source.points[${index}]`;
-          if (!isPlainObject(point)) {
-            errors.push({ path: p, message: "point must be an object" });
-            return;
-          }
-          checkUnknown(errors, point, new Set(["term", "md", "latex"]), p);
-          checkString(errors, `${p}.term`, point.term, "must be a string", { min: 0 });
-          checkString(errors, `${p}.md`, point.md, "must be a string", { optional: true, min: 0 });
-          checkString(errors, `${p}.latex`, point.latex, "must be a string", { optional: true, min: 0 });
-        });
-      }
-      break;
-    case "worked_example":
-      checkUnknown(errors, block.source, new Set(["title", "tag", "problem", "approach", "steps", "answer"]), `${path}.source`);
-      checkString(errors, `${path}.source.title`, block.source.title, "must be a string", { optional: true });
-      checkString(errors, `${path}.source.tag`, block.source.tag, "must be a string", { optional: true });
-      checkString(errors, `${path}.source.problem`, block.source.problem, "must be a string", { min: 0 });
-      checkString(errors, `${path}.source.approach`, block.source.approach, "must be a string", { optional: true, min: 0 });
-      checkString(errors, `${path}.source.answer`, block.source.answer, "must be a string", { optional: true, min: 0 });
-      if (block.source.steps !== undefined && !Array.isArray(block.source.steps)) {
-        errors.push({ path: `${path}.source.steps`, message: "must be an array" });
-      }
-      break;
-  }
-  let count = 1;
-  if (block.type === "container" && block.children !== undefined) {
-    if (!Array.isArray(block.children)) {
-      errors.push({ path: `${path}.children`, message: "must be an array" });
-    } else {
-      block.children.forEach((child, index) => {
-        count += validateBlock(child, `${path}.children[${index}]`, ids, errors);
-      });
-    }
-  }
-  return count;
-}
-
-function validateContentDocument(doc) {
-  const errors = [];
-  const warnings = [];
-  if (!isPlainObject(doc)) {
-    errors.push({ path: "(root)", message: "document must be a JSON object" });
-    return contentResult(errors, warnings, { block_count: 0 });
-  }
-  checkUnknown(errors, doc, new Set(["version", "blocks", "meta"]), "");
-  if (doc.version !== "1") errors.push({ path: "version", message: 'must be "1"' });
-  if (!isPlainObject(doc.meta)) {
-    errors.push({ path: "meta", message: "must be an object" });
-  } else {
-    checkString(errors, "meta.title", doc.meta.title, "must be a non-empty string");
-    checkString(errors, "meta.language", doc.meta.language, "must be a language string", { optional: true, min: 2, max: 16 });
-  }
-  const ids = new Set();
-  let blockCount = 0;
-  if (!Array.isArray(doc.blocks)) {
-    errors.push({ path: "blocks", message: "must be an array" });
-  } else {
-    doc.blocks.forEach((block, index) => {
-      blockCount += validateBlock(block, `blocks[${index}]`, ids, errors);
-    });
-  }
-  return contentResult(errors, warnings, { block_count: blockCount });
-}
-
-function nextBlockIdFactory() {
-  let n = 0;
-  return () => `b${String(++n).padStart(4, "0")}`;
-}
-
-function stripLeadingHeading(markdown) {
-  return String(markdown || "").replace(/^#{1,6}\s+.+(?:\r?\n|$)/, "").trim();
-}
-
-function blockToPlainText(block) {
-  switch (block.type) {
-    case "heading":
-    case "text":
-      return block.source.md || "";
-    case "equation":
-      return block.source.latex || "";
-    case "code":
-      return block.source.src || "";
-    case "exercise":
-      return [block.source.q, ...(block.source.choices || []), block.source.answer, block.source.explain].filter(Boolean).join(" ");
-    case "keypoints":
-      return [block.source.title, ...(block.source.points || []).map((p) => [p.term, p.md, p.latex].filter(Boolean).join(" "))].filter(Boolean).join(" ");
-    case "worked_example":
-      return [block.source.title, block.source.problem, block.source.approach, ...(block.source.steps || []).map((s) => [s.md, s.latex].filter(Boolean).join(" ")), block.source.answer].filter(Boolean).join(" ");
-    case "container":
-      return [block.source.title, ...(block.children || []).map(blockToPlainText)].filter(Boolean).join(" ");
-    default:
-      return "";
-  }
-}
-
-function makeSceneTitle(blocks, fallback) {
-  const heading = blocks.find((block) => block.type === "heading" && block.source.md?.trim());
-  if (heading) return heading.source.md.trim().slice(0, 48);
-  const text = blocks.map(blockToPlainText).find((part) => part.trim());
-  return text?.trim().slice(0, 48) || fallback;
-}
-
-function buildLessonOverlay(blocks) {
-  const scenes = [];
-  let current = [];
-  const flush = () => {
-    if (!current.length) return;
-    scenes.push({
-      id: `scene-${scenes.length + 1}`,
-      title: makeSceneTitle(current, `第 ${scenes.length + 1} 节`),
-      block_ids: current.map((block) => block.id),
-    });
-    current = [];
-  };
-  for (const block of blocks) {
-    if (block.type === "heading" && block.source.level <= 2) flush();
-    current.push(block);
-    if (block.type === "exercise") flush();
-  }
-  flush();
-  return scenes.length ? { scenes } : undefined;
-}
-
-function bookToContentDocument(book) {
-  const id = nextBlockIdFactory();
-  const blocks = [];
-  for (const chapter of book.chapters || []) {
-    blocks.push({ id: id(), type: "heading", source: { level: 2, md: chapter.title || "Chapter" } });
-    if (chapter.summary?.trim()) blocks.push({ id: id(), type: "text", source: { md: chapter.summary.trim() } });
-    for (const section of chapter.sections || []) {
-      blocks.push({ id: id(), type: "heading", source: { level: 3, md: section.title || "Section" } });
-      if (section.summary?.trim()) blocks.push({ id: id(), type: "text", source: { md: section.summary.trim() } });
-      const body = stripLeadingHeading(section.markdown);
-      if (body) blocks.push({ id: id(), type: "text", source: { md: body } });
-    }
-  }
-  const overlay = buildLessonOverlay(blocks);
-  return {
-    version: "1",
-    blocks,
-    meta: {
-      title: book.title,
-      language: book.language || "zh",
-      license: book.license,
-      refs: Array.isArray(book.source_refs)
-        ? book.source_refs
-            .map((ref) => (isPlainObject(ref) && typeof ref.title === "string" ? { title: ref.title, url: typeof ref.url === "string" ? ref.url : undefined } : null))
-            .filter(Boolean)
-        : undefined,
-      created_from: "luguo_cli",
-      source_format: "book_project",
-      ...(overlay ? { lesson_overlay: overlay } : {}),
-    },
-  };
-}
-
-function parseTags(raw) {
-  if (!raw) return [];
-  return String(raw)
-    .split(/[,，]/)
-    .map((tag) => tag.trim())
-    .filter(Boolean)
-    .slice(0, 8);
-}
-
-function contentTitle(document, fallback) {
-  return document?.meta?.title?.trim?.() || fallback || "Untitled";
-}
-
-function readJsonFile(filePath) {
-  let raw;
-  try {
-    raw = readFileSync(filePath, "utf8");
-  } catch {
-    die(`Cannot read file: ${filePath}`);
-  }
-  try {
-    return JSON.parse(raw);
-  } catch (e) {
-    die(`Not valid JSON (${filePath}): ${e.message}`);
-  }
-}
+// ---------------------------------------------------------------------------
+// luma-md project loading: one .md file = a lesson, a directory = a book.
 
 function parseScalar(value) {
-  const trimmed = value.trim();
-  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
-    return trimmed.slice(1, -1);
+  const raw = value.trim();
+  if (raw === "") return "";
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  if (/^-?\d+(\.\d+)?$/.test(raw)) return Number(raw);
+  if (raw.startsWith("[") && raw.endsWith("]")) {
+    return raw
+      .slice(1, -1)
+      .split(",")
+      .map((item) => item.trim().replace(/^["']|["']$/g, ""))
+      .filter(Boolean);
   }
-  if (trimmed === "true") return true;
-  if (trimmed === "false") return false;
-  return trimmed;
+  return raw.replace(/^["']|["']$/g, "");
 }
 
-function parseLuguoYaml(raw, filePath) {
-  const config = { chapters: [] };
-  let inChapters = false;
-  for (const [index, rawLine] of raw.split(/\r?\n/).entries()) {
-    const line = rawLine.replace(/\s+#.*$/, "");
-    if (!line.trim()) continue;
-    if (/^chapters:\s*$/.test(line.trim())) {
-      inChapters = true;
+// Minimal flat YAML: `key: value` lines plus `key:` + `- item` lists. Enough
+// for frontmatter and luguo.yml; nothing nested.
+function parseFlatYaml(raw) {
+  const out = {};
+  let listKey = null;
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim() || line.trim().startsWith("#")) continue;
+    const listMatch = line.match(/^\s*-\s+(.*)$/);
+    if (listMatch && listKey) {
+      out[listKey].push(parseScalar(listMatch[1]));
       continue;
     }
-    if (inChapters && /^\s*-\s+/.test(line)) {
-      config.chapters.push(parseScalar(line.replace(/^\s*-\s+/, "")));
-      continue;
+    const kv = line.match(/^([A-Za-z_][\w-]*)\s*:\s*(.*)$/);
+    if (!kv) continue;
+    const [, key, value] = kv;
+    if (value.trim() === "") {
+      out[key] = [];
+      listKey = key;
+    } else {
+      out[key] = parseScalar(value);
+      listKey = null;
     }
-    inChapters = false;
-    const match = /^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$/.exec(line);
-    if (!match) die(`Cannot parse ${filePath}:${index + 1}. Keep luguo.yml to simple key: value lines.`);
-    config[match[1].replace(/-/g, "_")] = parseScalar(match[2]);
   }
-  return config;
+  return out;
 }
 
-function sectionTitleFromMarkdown(part, fallback) {
-  const heading = /^#{1,3}\s+(.+)$/m.exec(part);
-  return heading?.[1]?.trim() || fallback;
+function splitFrontmatter(markdown) {
+  const match = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
+  if (!match) return { meta: {}, body: markdown.trim() };
+  return { meta: parseFlatYaml(match[1]), body: markdown.slice(match[0].length).trim() };
 }
 
-function splitMarkdownIntoSections(markdown) {
-  const parts = markdown
-    .split(/\n(?=#{1,3}\s+)/g)
-    .map((part) => part.trim())
-    .filter(Boolean);
-  const source = parts.length ? parts : [markdown.trim()];
-  return source.map((part, index) => ({
-    id: `s${index + 1}`,
-    title: sectionTitleFromMarkdown(part, `Section ${index + 1}`),
-    summary: "",
-    markdown: part,
-    meta: {},
-  }));
+function firstHeading(markdown) {
+  const match = markdown.match(/^#{1,3}\s+(.+)$/m);
+  return match ? match[1].trim() : null;
 }
 
-function loadBookProject(input = ".") {
-  const root = resolve(input);
-  if (!existsSync(root)) die(`Path does not exist: ${input}`);
-  const stat = statSync(root);
-  if (stat.isFile()) {
-    if (extname(root).toLowerCase() === ".json") {
-      const json = readJsonFile(root);
-      if (isContentDocument(json)) {
-        return {
-          root: dirname(root),
-          document: json,
-          book: {
-            title: contentTitle(json, basename(root, extname(root))),
-            summary: json.meta.summary || "",
-            book_kind: "cli",
-            language: json.meta.language || "zh",
-            visibility: "private",
-            chapters: [{ id: "ch1", title: contentTitle(json, basename(root, extname(root))), sections: [{ id: "s1", title: contentTitle(json, basename(root, extname(root))), markdown: blockToPlainText({ type: "container", source: { title: "" }, children: json.blocks }), meta: {} }], meta: {} }],
-            meta: { imported_content_document: true },
-          },
-        };
-      }
-      return { root: dirname(root), book: json };
-    }
-    const markdown = readFileSync(root, "utf8");
-    const title = basename(root, extname(root));
-    return {
-      root: dirname(root),
-      book: {
-        title,
-        summary: "",
-        book_kind: "cli",
-        language: "zh",
-        chapters: [{ id: "ch1", title, sections: splitMarkdownIntoSections(markdown), meta: {} }],
-      },
-    };
-  }
+function normTags(value) {
+  if (Array.isArray(value)) return value.map(String).filter(Boolean).slice(0, 8);
+  if (typeof value === "string") return value.split(",").map((s) => s.trim()).filter(Boolean).slice(0, 8);
+  return undefined;
+}
 
-  const yamlPath = join(root, "luguo.yml");
-  if (!existsSync(yamlPath)) die(`Missing ${relative(process.cwd(), yamlPath)}. Run \`luguo init book ${input}\`.`);
-  const config = parseLuguoYaml(readFileSync(yamlPath, "utf8"), yamlPath);
-  const chapterPaths = config.chapters?.length
-    ? config.chapters
-    : readdirSync(root).filter((name) => /\.md$/i.test(name)).sort();
-  if (!chapterPaths.length) die("No chapters found. Add chapters to luguo.yml.");
-
-  const chapters = chapterPaths.map((chapterPath, index) => {
-    const abs = resolve(root, chapterPath);
-    if (!existsSync(abs)) die(`Chapter not found: ${chapterPath}`);
-    const markdown = readFileSync(abs, "utf8");
-    const title = sectionTitleFromMarkdown(markdown, basename(chapterPath, extname(chapterPath)).replace(/^\d+[-_]/, ""));
-    return {
-      id: `ch${index + 1}`,
-      title,
-      summary: "",
-      source_path: chapterPath,
-      sections: splitMarkdownIntoSections(markdown).map((section, sectionIndex) => ({
-        ...section,
-        id: `ch${index + 1}s${sectionIndex + 1}`,
-        source_path: chapterPath,
-      })),
-      meta: {},
-    };
-  });
-
+function loadLessonFile(path) {
+  const raw = readFileSync(path, "utf8");
+  const { meta, body } = splitFrontmatter(raw);
+  if (!body) die(`Empty lesson body: ${path}`);
+  const fallback = basename(path, extname(path)).replace(/^\d+[-_]\s*/, "");
   return {
-    root,
-    book: {
-      title: config.title || basename(root),
-      subtitle: config.subtitle || "",
-      summary: config.summary || "",
-      audience: config.audience || "",
-      book_kind: config.book_kind || "cli",
-      language: config.language || "zh",
-      license: config.license || "private",
-      visibility: config.visibility || "private",
-      chapters,
-      concepts: [],
-      meta: { cli_project: true },
-    },
+    title: String(meta.title || firstHeading(body) || fallback),
+    summary: meta.summary ? String(meta.summary) : undefined,
+    tags: normTags(meta.tags),
+    visibility: VISIBILITIES.includes(meta.visibility) ? meta.visibility : undefined,
+    language: meta.language ? String(meta.language) : undefined,
+    emoji: meta.emoji || meta.cover_emoji ? String(meta.emoji || meta.cover_emoji) : undefined,
+    markdown: body,
+  };
+}
+
+function loadBookDir(root) {
+  const yamlPath = ["luguo.yml", "luguo.yaml", "book.yml"].map((n) => join(root, n)).find(existsSync);
+  const config = yamlPath ? parseFlatYaml(readFileSync(yamlPath, "utf8")) : {};
+  const chapterPaths = Array.isArray(config.chapters) && config.chapters.length
+    ? config.chapters
+    : readdirSync(root)
+        .filter((name) => /\.md$/i.test(name) && !name.startsWith("_") && !name.startsWith("."))
+        .sort();
+  if (!chapterPaths.length) die(`No chapter .md files in ${root}. Add chapters or a luguo.yml.`);
+  const chapters = chapterPaths.map((rel) => {
+    const abs = resolve(root, String(rel));
+    if (!existsSync(abs)) die(`Chapter not found: ${rel}`);
+    return { source: String(rel), ...loadLessonFile(abs) };
+  });
+  return {
+    title: String(config.title || basename(root)),
+    subtitle: config.subtitle ? String(config.subtitle) : undefined,
+    summary: config.summary ? String(config.summary) : "",
+    tags: normTags(config.tags) ?? [],
+    visibility: VISIBILITIES.includes(config.visibility) ? config.visibility : "private",
+    language: config.language ? String(config.language) : "zh",
+    emoji: config.emoji || config.cover_emoji ? String(config.emoji || config.cover_emoji) : "📚",
+    chapters,
   };
 }
 
@@ -702,222 +228,247 @@ function loadProjectState(input = ".") {
   return JSON.parse(readFileSync(statePath, "utf8"));
 }
 
-function printValidation(out, label = "") {
+function printValidation(out, label) {
   const prefix = label ? `${label}: ` : "";
-  const artifact = out.artifact || "book";
   if (out.valid) {
-    const stats = [];
-    if (out.block_count !== undefined) stats.push(`${out.block_count} block(s)`);
-    if (out.chapter_count !== undefined) stats.push(`${out.chapter_count} chapter(s)`);
-    if (out.section_count !== undefined) stats.push(`${out.section_count} section(s)`);
-    if (out.concept_count !== undefined) stats.push(`${out.concept_count} concept(s)`);
-    if (out.node_count !== undefined) stats.push(`${out.node_count} planned node(s)`);
-    ok(`${prefix}${artifact} valid${stats.length ? ` (${stats.join(", ")})` : ""}`);
+    const counts = Object.entries(out.block_counts || {})
+      .map(([kind, count]) => `${kind}×${count}`)
+      .join(" ");
+    ok(`${prefix}${out.blocks ?? out.block_count ?? "?"} block(s), ${out.scenes ?? out.scene_count ?? "?"} scene(s)${counts ? ` (${counts})` : ""}`);
   } else {
-    console.error(c.red(`Invalid: ${prefix}${artifact} (${out.errors.length} error(s))`));
-    for (const error of out.errors) console.error(`  - ${error.path}: ${error.message}`);
+    console.error(c.red(`Invalid: ${prefix}${(out.errors || []).map((e) => e.message || e).join("; ") || "no parsable blocks"}`));
   }
-  if (out.warnings?.length) {
-    console.error(c.dim(`  ${out.warnings.length} warning(s):`));
-    for (const warning of out.warnings) console.error(c.dim(`  - ${warning.path}: ${warning.message}`));
+  for (const warning of out.warnings || []) {
+    console.error(c.dim(`  warning: ${warning.message || warning}`));
   }
+  return !!out.valid;
 }
+
+// ---------------------------------------------------------------------------
+// Commands
 
 async function cmdLogin(args) {
-  const creds = loadCreds() || {};
+  const key = args.key || process.env.LUGUO_API_KEY;
+  if (!key) die("Usage: luguo login --key luguo_xxx [--base-url https://luguo.ai]");
+  const creds = { api_key: String(key) };
   if (args["base-url"]) creds.base_url = String(args["base-url"]).replace(/\/+$/, "");
-  let key = typeof args.key === "string" ? args.key : null;
-  if (!key) key = await readStdinMaybe();
-  if (!key) {
-    const rl = createInterface({ input: stdin, output: stdout });
-    key = (await rl.question("Paste your luguo_ API key: ")).trim();
-    rl.close();
-  }
-  if (!key || !String(key).startsWith("luguo_")) die("API key should start with luguo_");
-  creds.api_key = String(key).trim();
-  const status = await api(creds, "GET", "/api/v1/agents/status");
-  creds.agent_id = status.agent_id || status.id || creds.agent_id;
-  creds.agent_handle = status.handle || creds.agent_handle;
+  const home = await api(creds, "GET", "/api/v1/agent/home");
   saveCreds(creds);
-  ok(`Logged in as @${creds.agent_handle || "agent"}`);
-  info(c.dim(`Credentials saved to ${CRED_PATH}`));
-}
-
-async function cmdRegister(args) {
-  const creds = loadCreds() || {};
-  if (args["base-url"]) creds.base_url = String(args["base-url"]).replace(/\/+$/, "");
-  info("Agent registration now happens in luguo settings.");
-  info("");
-  info(`1. Open ${c.cyan(`${baseUrl(creds)}/settings`)}`);
-  info("2. Create an agent key in the Agent access section.");
-  info("3. Run `luguo login --key luguo_xxx`.");
-  process.exit(1);
+  ok(`Logged in as @${home.agent?.handle || "agent"} (${baseUrl(creds)})`);
 }
 
 async function cmdStatus() {
   const creds = loadCreds();
-  const status = await api(creds, "GET", "/api/v1/agents/status");
-  info(`${c.bold("agent")}    @${status.handle || status.agent_id || status.id}`);
-  info(`${c.bold("claimed")}  ${status.claimed ? c.green("yes") : c.dim("no")}`);
-  if (status.owner?.handle) info(`${c.bold("owner")}    @${status.owner.handle}`);
-  info(`${c.bold("base")}     ${baseUrl(creds)}`);
+  if (!creds && !process.env.LUGUO_API_KEY) die("Not logged in. Run `luguo login --key luguo_xxx`.");
+  const home = await api(creds, "GET", "/api/v1/agent/home");
+  const agent = home.agent || {};
+  info(`@${agent.handle || "agent"} ${agent.claimed ? c.green("(claimed)") : c.dim("(unclaimed)")}  ${c.dim(baseUrl(creds))}`);
 }
 
 async function cmdDoctor() {
   const creds = loadCreds();
-  info(`base_url  ${baseUrl(creds)}`);
-  info(`creds     ${existsSync(CRED_PATH) ? CRED_PATH : c.dim("(none)")}`);
+  const base = baseUrl(creds);
+  let res;
   try {
-    const res = await fetch(`${baseUrl(creds)}/skill.md`);
-    info(`reach     ${res.ok ? c.green("ok") : c.red(`HTTP ${res.status}`)}`);
+    res = await fetch(`${base}/skill.md`);
   } catch (e) {
-    info(`reach     ${c.red(e.message)}`);
+    die(`Cannot reach ${base}: ${e.message}`);
   }
-  if (creds?.api_key || process.env.LUGUO_API_KEY) {
-    const status = await api(creds, "GET", "/api/v1/agents/status");
-    info(`identity  @${status.handle} ${status.claimed ? c.green("(claimed)") : c.dim("(unclaimed)")}`);
-  } else {
-    info(`identity  ${c.dim("not logged in")}`);
+  info(`${res.ok ? c.green("OK") : c.red("FAIL")}  GET ${base}/skill.md (${res.status})`);
+  if (!creds?.api_key && !process.env.LUGUO_API_KEY) {
+    info(c.dim("No API key saved. Run `luguo login --key luguo_xxx`."));
+    return;
   }
-  ok("doctor done");
+  const home = await api(creds, "GET", "/api/v1/agent/home");
+  info(`${c.green("OK")}  agent @${home.agent?.handle || "?"}, ${home.quota?.daily_create_remaining ?? "?"} create(s) left today`);
 }
 
-function cmdInit(args) {
-  const type = args._[1];
-  const dir = args._[2] || "my-book";
-  if (type !== "book") die("Usage: luguo init book <dir>");
-  const root = resolve(dir);
-  if (existsSync(root) && readdirSync(root).length > 0) die(`Directory is not empty: ${dir}`);
-  mkdirSync(join(root, "chapters"), { recursive: true });
-  writeFileSync(
-    join(root, "luguo.yml"),
-    `title: 用生活例子学概率
-summary: 用奶茶、抽卡和天气例子理解概率基础。
-audience: 高中到大学低年级
-language: zh
+const LESSON_TEMPLATE = `---
+title: 我的第一课
+summary: 一句话说明这节课教什么。
+tags: [示例]
 visibility: private
-chapters:
-  - chapters/01-conditional-probability.md
-  - chapters/02-bayes.md
-`
-  );
-  writeFileSync(
-    join(root, "chapters", "01-conditional-probability.md"),
-    `# 条件概率是什么
+---
 
-条件概率是在某个条件已经发生时，另一件事发生的可能性。
+# 我的第一课
 
-如果我们知道一个人经常健身，再判断他是否喜欢无糖奶茶，这个判断就会和完全不知道背景时不同。
-`
-  );
-  writeFileSync(
-    join(root, "chapters", "02-bayes.md"),
-    `# 贝叶斯定理
+正文是标准 Markdown,支持 $LaTeX$、表格、代码块。
 
-贝叶斯定理用来在看到新证据后更新某个假设的可信度。
+:::keypoints 核心概念
+- **概念 A**: 一句话定义
+:::
 
-P(H|E)=P(E|H)P(H)/P(E)
+:::quiz 一道检查题?
+- [x] 正确选项
+- [ ] 错误选项
+@id q-demo-1
+@explain 为什么正确选项对。
+:::
+`;
 
-# 小练习
+function cmdInit(args) {
+  if (args._[1] === "book") {
+    const dir = resolve(args._[2] || "my-book");
+    mkdirSync(dir, { recursive: true });
+    const yamlPath = join(dir, "luguo.yml");
+    if (existsSync(yamlPath)) die(`${yamlPath} already exists.`);
+    writeFileSync(yamlPath, `title: ${basename(dir)}\nsummary: 一句话介绍这本书。\ntags: [示例]\nvisibility: private\nlanguage: zh\nemoji: 📚\n# chapters 缺省时按文件名排序取全部 .md\n`);
+    writeFileSync(join(dir, "01-第一章.md"), LESSON_TEMPLATE.replace(/我的第一课/g, "第一章"));
+    writeFileSync(join(dir, "02-第二章.md"), LESSON_TEMPLATE.replace(/我的第一课/g, "第二章"));
+    ok(`Book project created: ${dir}`);
+    info(c.dim(`Edit the chapters, then run \`luguo publish ${args._[2] || "my-book"}\`.`));
+    return;
+  }
+  const path = resolve(args._[1] || "lesson.md");
+  if (existsSync(path)) die(`${path} already exists.`);
+  writeFileSync(path, LESSON_TEMPLATE);
+  ok(`Lesson template created: ${path}`);
+}
 
-已知 P(H)=0.3，P(E|H)=0.7，P(E)=0.5。请计算 P(H|E)。
-`
-  );
-  ok(`Created Book project at ${relative(process.cwd(), root) || "."}`);
-  info(`Next: cd ${relative(process.cwd(), root) || "."} && luguo validate && luguo publish`);
+async function serverValidate(creds, markdown) {
+  return api(creds, "POST", "/api/agent/validate", { body: { artifact: "luma_md", markdown } });
 }
 
 async function cmdValidate(args) {
-  rejectRemovedOptions(args, ["as-source"]);
-  const input = args._[1] || ".";
-  const { book, document } = loadBookProject(input);
-  if (document) {
-    const local = validateContentDocument(document);
-    printValidation(local, "local");
-    if (!local.valid) process.exit(1);
+  const input = resolve(args._[1] || ".");
+  if (!existsSync(input)) die(`Path does not exist: ${args._[1] || "."}`);
+  const creds = loadCreds();
+  if (statSync(input).isDirectory()) {
+    const book = loadBookDir(input);
+    info(`${c.bold(book.title)} — ${book.chapters.length} chapter(s)`);
+    let valid = true;
+    for (const chapter of book.chapters) {
+      const out = await serverValidate(creds, chapter.markdown);
+      valid = printValidation(out, chapter.source) && valid;
+    }
+    if (!valid) process.exit(1);
     return;
   }
-  if (args.visibility && VISIBILITIES.includes(String(args.visibility))) book.visibility = String(args.visibility);
-  const local = validateBook(book);
-  printValidation(local, "local");
-  if (!local.valid) process.exit(1);
-  const content = validateContentDocument(bookToContentDocument(book));
-  printValidation(content, "content");
-  if (!content.valid) process.exit(1);
+  const lesson = loadLessonFile(input);
+  const out = await serverValidate(creds, lesson.markdown);
+  if (!printValidation(out, lesson.title)) process.exit(1);
+}
+
+async function publishLessonFile(creds, path, args) {
+  const lesson = loadLessonFile(path);
+  const out = await api(creds, "POST", "/api/agent/lessons", {
+    body: {
+      title: String(args.title || lesson.title),
+      summary: args.summary !== undefined ? String(args.summary) : lesson.summary,
+      tags: normTags(args.tags) ?? lesson.tags,
+      visibility: VISIBILITIES.includes(args.visibility) ? args.visibility : lesson.visibility,
+      language: lesson.language,
+      cover_emoji: args.emoji ? String(args.emoji) : lesson.emoji,
+      body: { format: "luma-md-v1", markdown: lesson.markdown },
+    },
+  });
+  const url = absoluteUrl(creds, out.lesson?.url);
+  saveProjectState(dirname(path), {
+    lesson_id: out.lesson?.id || null,
+    lesson_slug: out.lesson?.slug || null,
+    url,
+    published_at: new Date().toISOString(),
+  });
+  ok(`Lesson published: ${lesson.title}`);
+  info(`  blocks  ${out.blocks} (${Object.entries(out.block_counts || {}).map(([k, n]) => `${k}×${n}`).join(" ")})`);
+  info(`  scenes  ${out.scenes}`);
+  info(`  url     ${c.cyan(url)}`);
+}
+
+async function publishBookDir(creds, root, args) {
+  const book = loadBookDir(root);
+  const visibility = VISIBILITIES.includes(args.visibility) ? args.visibility : book.visibility;
+  info(`${c.bold(book.title)} — ${book.chapters.length} chapter(s)`);
+
+  // Create the book container private first; flip visibility once at the end
+  // so the publish cascade covers every chapter lesson in one go.
+  const created = await api(creds, "POST", "/api/books", {
+    body: {
+      title: String(args.title || book.title),
+      subtitle: book.subtitle,
+      summary: String(args.summary ?? book.summary ?? ""),
+      tags: normTags(args.tags) ?? book.tags,
+      visibility: "private",
+      cover_emoji: args.emoji ? String(args.emoji) : book.emoji,
+      language: book.language,
+    },
+  });
+  const bookId = created.book?.id;
+  if (!bookId) die("Server did not return a book id.");
+
+  const published = [];
+  let course = null;
+  for (const chapter of book.chapters) {
+    const out = await api(creds, "POST", `/api/books/${bookId}/chapters`, {
+      body: { title: chapter.title, summary: chapter.summary ?? "", markdown: chapter.markdown },
+    });
+    published.push({ source: chapter.source, chapter_id: out.chapter?.id, lesson_id: out.lesson?.id, lesson_slug: out.lesson?.slug });
+    if (out.course) course = out.course;
+    info(`  ${c.green("+")} ${chapter.source} → ${chapter.title}`);
+  }
+
+  if (visibility !== "private") {
+    await api(creds, "PATCH", `/api/books/${bookId}`, { body: { visibility } });
+  }
+
+  const workspaceUrl = absoluteUrl(creds, `/create/${bookId}`);
+  // 读者入口是书的主 course(/books/<course slug>),不是 book slug。
+  const readerUrl = course ? absoluteUrl(creds, `/books/${course.slug || course.id}`) : workspaceUrl;
+  saveProjectState(root, {
+    book_id: bookId,
+    book_slug: created.book?.slug || null,
+    url: readerUrl,
+    workspace_url: workspaceUrl,
+    chapters: published,
+    published_at: new Date().toISOString(),
+  });
+  ok(`Book published: ${book.title} (${published.length} chapter(s), ${visibility})`);
+  info(`  reader     ${c.cyan(readerUrl)}`);
+  info(`  workspace  ${c.cyan(workspaceUrl)}`);
 }
 
 async function cmdPublish(args) {
-  rejectRemovedOptions(args, ["as-source", "no-plan", "skip-server-validate"]);
-  const input = args._[1] || ".";
+  const input = resolve(args._[1] || ".");
+  if (!existsSync(input)) die(`Path does not exist: ${args._[1] || "."}`);
   const creds = loadCreds();
-  const { root, book, document: loadedDocument } = loadBookProject(input);
-  if (args.visibility) {
-    if (!VISIBILITIES.includes(String(args.visibility))) die(`--visibility must be one of ${VISIBILITIES.join("/")}`);
-    book.visibility = String(args.visibility);
-  }
-  const local = loadedDocument ? null : validateBook(book);
-  if (local) {
-    printValidation(local, "local");
-    if (!local.valid) process.exit(1);
-  }
+  if (statSync(input).isDirectory()) return publishBookDir(creds, input, args);
+  return publishLessonFile(creds, input, args);
+}
 
-  const document = loadedDocument || bookToContentDocument(book);
-  if (args.title) document.meta.title = String(args.title);
-  const content = validateContentDocument(document);
-  printValidation(content, "content");
-  if (!content.valid) process.exit(1);
-  const title = String(args.title || contentTitle(document, book.title)).trim();
-  const out = await api(creds, "POST", "/api/lessons/import", {
-    body: {
-      title,
-      summary: String(args.summary ?? book.summary ?? "").slice(0, 600),
-      tags: parseTags(args.tags),
-      visibility: book.visibility || "private",
-      cover_emoji: String(args.emoji || book.meta?.cover_emoji || "📖").slice(0, 8),
-      document,
-    },
-  });
-  const lesson = out.lesson || {};
-  const lessonUrl = absoluteUrl(creds, lesson.url || `/lessons/${lesson.slug || lesson.id}`);
-  saveProjectState(root, {
-    lesson_id: lesson.id || null,
-    lesson_slug: lesson.slug || null,
-    lesson_url: lessonUrl,
-    embed_url: lesson.embed_url ? absoluteUrl(creds, lesson.embed_url) : null,
-    published_at: new Date().toISOString(),
-    mode: "content",
-  });
-  ok(`Book published to the editor format: ${lesson.title || title}`);
-  info(`  id          ${c.cyan(lesson.id || "(unknown)")}`);
-  info(`  slug        ${lesson.slug || "(unknown)"}`);
-  info(`  blocks      ${content.block_count}`);
-  info(`  lesson_url  ${c.cyan(lessonUrl)}`);
+async function cmdLessons() {
+  const creds = loadCreds();
+  const out = await api(creds, "GET", "/api/v1/agent/home");
+  const items = out.my_lessons || out.my_contents || [];
+  if (!items.length) {
+    info(c.dim("No lessons yet."));
+    return;
+  }
+  for (const item of items) {
+    const url = item.slug ? absoluteUrl(creds, `/lessons/${item.slug}`) : "";
+    info(`${c.cyan(item.id)}  ${item.title}  ${c.dim(`${item.visibility || "private"} ${url}`)}`);
+  }
 }
 
 async function cmdBooks() {
   const creds = loadCreds();
-  const out = await api(creds, "GET", "/api/v1/agent/home");
-  const books = out.my_contents || [];
+  const out = await api(creds, "GET", "/api/books");
+  const books = out.books || [];
   if (!books.length) {
     info(c.dim("No books yet."));
     return;
   }
   for (const book of books) {
-    const url = book.slug ? absoluteUrl(creds, `/lessons/${book.slug}`) : "";
-    info(`${c.cyan(book.id)}  ${book.title}  ${c.dim(`${book.visibility || "private"} [${book.review_status || "ready"}] ${url}`)}`);
+    info(`${c.cyan(book.id)}  ${book.title}  ${c.dim(`${book.visibility || "private"} ${absoluteUrl(creds, book.url || `/create/${book.id}`)}`)}`);
   }
 }
 
 function cmdOpen(args) {
-  rejectRemovedOptions(args, ["book", "path", "source"]);
   const state = loadProjectState(args._[1] || ".");
-  if (!state) die("No publish state found. Run `luguo publish` first.");
-  const url = state.lesson_url;
-  if (!url) die("Publish state does not include a current editor URL. Run `luguo publish` with this CLI version.");
-  info(url);
+  if (!state?.url) die("No publish state found. Run `luguo publish` first.");
+  info(state.url);
   if (!args.print) {
     const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
-    const openerArgs = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+    const openerArgs = process.platform === "win32" ? ["/c", "start", "", state.url] : [state.url];
     const child = spawn(opener, openerArgs, { detached: true, stdio: "ignore" });
     child.unref();
   }
@@ -929,11 +480,6 @@ async function cmdHome() {
   const agent = home.agent || {};
   info(`${c.bold(`@${agent.handle || "agent"}`)} ${agent.claimed ? c.green("(claimed)") : c.dim("(unclaimed)")}`);
   if (home.quota) info(c.dim(`Quota: ${home.quota.daily_create_remaining ?? "?"} create(s) left today`));
-  if ((home.my_contents || []).length) {
-    info("");
-    info(c.bold(`Recent writes (${home.my_contents.length}):`));
-    for (const item of home.my_contents) info(`  ${item.title} ${c.dim(`[${item.review_status || "ready"}]`)}`);
-  }
 }
 
 async function cmdSkill(args) {
@@ -955,65 +501,45 @@ async function cmdSkill(args) {
   }
 }
 
-function removedCommand(name) {
-  die(`\`${name}\` was removed. Use \`luguo init book\`, \`luguo validate\`, and \`luguo publish\`.`);
-}
-
 function cmdHelp() {
-  info(`${c.bold("luguo")} - publish Books to luguo's current editor format.
+  info(`${c.bold("luguo")} - publish luma-md lessons and books to luguo.
 
 Usage:
-  luguo login [--key luguo_xxx] [--base-url URL]                Log in with an existing key
-  luguo doctor                                                  Self-check connectivity and identity
-  luguo status                                                  Show current agent status
-  luguo skill [--save]                                          Print or save the live Book contract
-  luguo init book <dir>                                         Create a Book project
-  luguo validate [dir|book.json|document.json|chapter.md]       Validate the current editor document shape locally
-  luguo publish [dir|book.json|document.json|chapter.md]        Publish as the /books/new editor ContentDocument
-  luguo books                                                   List recent editor-format Books from this agent
-  luguo open [dir] [--print]                                    Open the latest published editor result
-  luguo home                                                    Show agent status and recent writes
+  luguo login --key luguo_xxx [--base-url URL]   save your agent key
+  luguo status | whoami                          show identity
+  luguo doctor                                   check connectivity + key
+  luguo skill [--save]                           fetch the luma-md guide (/skill.md)
+  luguo init [lesson.md]                         create a lesson template
+  luguo init book [dir]                          create a book project (luguo.yml + chapters)
+  luguo validate <file.md | dir>                 server-side validation
+  luguo publish <file.md | dir>                  file → lesson, directory → book
+      [--title T] [--summary S] [--tags a,b] [--visibility private|unlisted|public] [--emoji E]
+  luguo lessons                                  list your published lessons
+  luguo books                                    list your books
+  luguo open [path]                              open the last published URL
+  luguo home                                     agent dashboard + quota
 
-Environment:
-  LUGUO_BASE_URL   Override the service endpoint (default ${DEFAULT_BASE})
-  LUGUO_API_KEY    Override the key from the credentials file
-
-Options:
-  login:    --key luguo_xxx --base-url URL
-  validate: --local
-  publish:  --visibility private|unlisted|public --title T --summary S --tags a,b --emoji 📖
-
-Credentials file: ${CRED_PATH}
-Create keys at:   ${DEFAULT_BASE}/settings
-Full contract:    ${DEFAULT_BASE}/skill.md`);
+A lesson is one .md file: YAML frontmatter (title/summary/tags/visibility/
+language/emoji) + a luma-md body. A book is a directory: optional luguo.yml
+(same fields + chapters list) + one .md per chapter, sorted by filename.
+Env: LUGUO_API_KEY, LUGUO_BASE_URL override saved credentials.`);
 }
 
 const args = parseArgs(process.argv.slice(2));
 const cmd = args._[0] ?? "help";
 const table = {
   login: cmdLogin,
-  register: cmdRegister,
   status: cmdStatus,
   whoami: cmdStatus,
   doctor: cmdDoctor,
   init: cmdInit,
   validate: cmdValidate,
   publish: cmdPublish,
+  lessons: cmdLessons,
   books: cmdBooks,
-  book: async (a) => {
-    const sub = a._[1] || "help";
-    if (sub === "list" || sub === "ls") return cmdBooks(a);
-    if (sub === "publish") return cmdPublish({ ...a, _: ["publish", a._[2]].filter(Boolean) });
-    if (sub === "init") return cmdInit({ ...a, _: ["init", "book", a._[2]].filter(Boolean) });
-    cmdHelp();
-  },
   open: cmdOpen,
   home: cmdHome,
   skill: cmdSkill,
-  material: () => removedCommand("luguo material"),
-  materials: () => removedCommand("luguo materials"),
-  plan: () => removedCommand("luguo plan"),
-  plans: () => removedCommand("luguo plans"),
   help: cmdHelp,
 };
 
@@ -1023,9 +549,4 @@ if (!fn) {
   cmdHelp();
   process.exit(1);
 }
-
-try {
-  await fn(args);
-} catch (e) {
-  die(e?.message || String(e));
-}
+await fn(args);

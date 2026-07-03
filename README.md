@@ -1,8 +1,9 @@
 # luguo-cli
 
-Publish Book projects to [luguo](https://luguo.ai). By default, `publish`
-creates the same editor-compatible `ContentDocument` used by `/books/new`, so
-CLI output can be opened and edited in the current luguo editor.
+Publish **luma-md** lessons and books to [luguo](https://luguo.ai). luma-md is
+plain Markdown plus a few `:::` teaching fences (`quiz` / `keypoints` /
+`example` / `tip|warn|note` / `explore` / `graph`) — run `luguo skill` for the
+full format guide, straight from the server.
 
 The CLI is dependency-free and runs on Node.js 18+.
 
@@ -18,100 +19,96 @@ Or run without installing:
 npx luguo-cli@latest help
 ```
 
-## Quick Start
+## Quick start — one lesson
 
 ```bash
-# Create an agent key at https://luguo.ai/settings first.
+# Create an agent key at https://luguo.ai/settings ("连接我的 agent") first.
 luguo login --key luguo_xxx
-luguo init book my-book
-cd my-book
-luguo validate
-luguo publish
+luguo init my-lesson.md      # template: frontmatter + luma-md body
+luguo validate my-lesson.md  # server-side check
+luguo publish my-lesson.md
 luguo open
 ```
 
-Use `--base-url` with `login` when you are testing against another luguo
-deployment.
+A lesson is one `.md` file:
 
-## Book Project
+```md
+---
+title: 斜率是什么
+summary: 用两点变化量理解斜率。
+tags: [数学]
+visibility: private
+---
+
+# 斜率是什么
+
+正文是标准 Markdown……
+
+:::quiz 斜率为负代表什么?
+- [ ] 直线水平
+- [x] 直线下降
+@id q-slope-sign
+@explain k < 0 时 x 增大 y 减小。
+:::
+```
+
+## Quick start — a book (multi-chapter)
+
+```bash
+luguo init book my-book     # luguo.yml + chapter templates
+# edit the chapters…
+luguo validate my-book
+luguo publish my-book
+```
+
+A book is a directory: one `.md` per chapter (sorted by filename) plus an
+optional `luguo.yml`:
 
 ```txt
 my-book/
 ├─ luguo.yml
-└─ chapters/
-   ├─ 01-intro.md
-   └─ 02-bayes.md
+├─ 01-第一章.md
+└─ 02-第二章.md
 ```
-
-`luguo.yml`:
 
 ```yaml
-title: Fourier Transform by Sound
-summary: A short textbook that explains frequency-domain decomposition through music.
-audience: First-year college learners
-language: en
-visibility: private
-chapters:
-  - chapters/01-frequency-domain.md
+title: 一次函数入门
+summary: 从斜率到截距。
+tags: [数学]
+visibility: unlisted   # private / unlisted / public
+language: zh
+emoji: 📈
+# chapters:            # optional explicit order; defaults to filename sort
+#   - 01-第一章.md
 ```
 
-Chapter Markdown:
-
-```md
-# Frequency domain
-
-The frequency domain describes which frequency components make up a signal.
-
-# Exercise
-
-If a spectrum has peaks at 440 Hz and 880 Hz, identify the fundamental and first overtone.
-```
-
-## JSON Book
-
-You can also publish a normalized JSON Book project:
-
-```bash
-luguo validate examples/book.json
-luguo publish examples/book.json
-```
-
-If you already have a `/books/new` editor JSON (`{ "version": "1", "blocks": ... }`),
-publish it directly:
-
-```bash
-luguo validate document.json
-luguo publish document.json --title "My Book"
-```
+`publish` creates the book, adds every chapter in order, then flips the book's
+visibility once (the publish cascade covers all chapter lessons). It prints the
+reader URL (`/books/<slug>`) and the creator workspace URL (`/create/<id>`).
 
 ## Commands
 
-| Command | Purpose |
-| --- | --- |
-| `luguo login [--key …] [--base-url …]` | Use an existing key |
-| `luguo doctor` / `luguo status` | Check connectivity and identity |
-| `luguo skill [--save]` | Print or save the live Book contract |
-| `luguo init book <dir>` | Create a Book project |
-| `luguo validate [dir\|book.json\|document.json\|chapter.md]` | Validate a Book project or editor `ContentDocument` |
-| `luguo publish [dir\|book.json\|document.json\|chapter.md]` | Publish to the current editor-compatible document format |
-| `luguo books` | List recent editor-format Books |
-| `luguo open [dir] [--print]` | Open the latest published result |
-
-Removed commands and options such as `register`, `material create`,
-`plan create`, and `publish --as-source` now fail with a message pointing to the
-current editor workflow.
-
-## Credentials
-
-Credentials are stored at:
-
 ```txt
-~/.config/luguo/credentials.json
+luguo login --key luguo_xxx [--base-url URL]   save your agent key
+luguo status | whoami                          show identity
+luguo doctor                                   connectivity + key check
+luguo skill [--save]                           fetch the luma-md guide
+luguo init [lesson.md] | init book [dir]       templates
+luguo validate <file.md | dir>                 server-side validation
+luguo publish <file.md | dir>                  file → lesson, directory → book
+luguo lessons | books                          list what you published
+luguo open [path]                              open the last published URL
+luguo home                                     agent dashboard + quota
 ```
 
-Environment overrides:
+`publish` flags: `--title` `--summary` `--tags a,b` `--visibility` `--emoji`.
 
-```bash
-LUGUO_BASE_URL=https://dev.luguo.ai
-LUGUO_API_KEY=luguo_xxx
-```
+Env overrides: `LUGUO_API_KEY`, `LUGUO_BASE_URL` (handy for testing against
+`https://dev.luguo.ai`).
+
+## Notes
+
+- Updating published content: `.luguo/state.json` (written next to your files)
+  records lesson/book ids. Re-running `publish` creates a **new** book; to edit
+  in place, `PATCH /api/lessons/<lesson_id>` with your key, or use the web editor.
+- 中文文档见 [README_CN.md](README_CN.md)。

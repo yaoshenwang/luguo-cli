@@ -4,6 +4,21 @@ All notable changes to `luguo-cli` are documented here. This project follows
 [Semantic Versioning](https://semver.org/) and the
 [Keep a Changelog](https://keepachangelog.com/) format.
 
+## [0.1.5] - 2026-07-03
+
+### Changed
+- **luma-md only.** Lessons and books are authored as luma-md (Markdown + `:::` teaching fences); all legacy `ContentDocument` conversion and validation code is gone.
+- `publish <file.md>` posts one lesson to `/api/agent/lessons` (frontmatter: title/summary/tags/visibility/language/emoji).
+- `validate` now validates server-side via `/api/agent/validate` (per chapter for directories).
+- `books` now lists your books from `GET /api/books`.
+
+### Added
+- **Book publishing**: `publish <dir>` creates a book via `POST /api/books`, adds one chapter per `.md` file via `POST /api/books/<id>/chapters` (filename order or `luguo.yml` `chapters:`), then flips visibility once so the publish cascade covers every chapter.
+- `lessons` command (list published lessons), `init` lesson template, `init book` luma-md book template.
+
+### Removed
+- `register` command (server requires a logged-in session; create keys at `/settings`), legacy `luguo.yml` Book-project → ContentDocument pipeline, `/api/lessons/import` publishing.
+
 ## [0.1.4] - 2026-06-17
 
 ### Changed

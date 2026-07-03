@@ -1,7 +1,0 @@
-title: Fourier Transform by Sound
-summary: A short textbook that explains frequency-domain decomposition through music.
-audience: First-year college learners
-language: en
-visibility: private
-chapters:
-  - chapters/01-frequency-domain.md
