@@ -5,6 +5,7 @@
 // a directory of .md chapters publishes as one book (POST /api/books + chapters).
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -95,9 +96,70 @@ function requireKey(creds) {
   return key;
 }
 
-async function api(creds, method, path, { body, auth = true } = {}) {
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item === undefined ? null : item)).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .filter((key) => value[key] !== undefined)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function stableIdempotencyKey(creds, method, path, body) {
+  // Namespace deterministic payload fingerprints by site and credential. This
+  // prevents two agent identities publishing identical content from sharing an
+  // idempotency key, while never sending or persisting the credential itself.
+  const identityScope = createHash("sha256")
+    .update(`${baseUrl(creds)}\n${requireKey(creds)}`)
+    .digest("hex");
+  const digest = createHash("sha256")
+    .update(`${identityScope}\n${method.toUpperCase()}\n${path}\n${canonicalJson(body)}`)
+    .digest("hex");
+  return `luguo-cli-v1-${digest}`;
+}
+
+function normalizeIssuePath(path) {
+  if (Array.isArray(path)) return path.join(".");
+  return path ? String(path) : "content";
+}
+
+function formatApiIssues(json) {
+  const issues = Array.isArray(json?.issues)
+    ? json.issues
+    : Array.isArray(json?.admission?.issues)
+      ? json.admission.issues
+      : [];
+  if (!issues.length) return "";
+  return `\n${issues
+    .map((issue) => {
+      if (typeof issue === "string") return `  - ${issue}`;
+      const code = issue?.code ? ` [${issue.code}]` : "";
+      const path = normalizeIssuePath(issue?.path);
+      return `  - ${path}${code}: ${issue?.message || "Admission gate rejected this content."}`;
+    })
+    .join("\n")}`;
+}
+
+function apiErrorMessage(status, json, raw) {
+  const error = typeof json?.error === "string"
+    ? json.error
+    : json?.error?.message || json?.message || raw.slice(0, 300) || "Request failed";
+  return `HTTP ${status}: ${error}${formatApiIssues(json)}`;
+}
+
+async function api(creds, method, path, {
+  body,
+  auth = true,
+  expectedStatus,
+  idempotencyKey,
+  returnMeta = false,
+} = {}) {
   const headers = { "content-type": "application/json" };
   if (auth) headers.authorization = `Bearer ${requireKey(creds)}`;
+  if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
   let res;
   try {
     res = await fetch(`${baseUrl(creds)}${path}`, {
@@ -115,8 +177,127 @@ async function api(creds, method, path, { body, auth = true } = {}) {
   } catch {
     json = { raw: text };
   }
-  if (!res.ok) die(`HTTP ${res.status}: ${json.error || text.slice(0, 300)}`);
-  return json;
+  if (!res.ok) die(apiErrorMessage(res.status, json, text));
+  if (expectedStatus !== undefined && res.status !== expectedStatus) {
+    die(`Expected HTTP ${expectedStatus} from ${method} ${path}, received HTTP ${res.status}. The content was not accepted as ready.`);
+  }
+  return returnMeta ? { json, status: res.status, headers: res.headers } : json;
+}
+
+function admissionRetryMs(headers) {
+  const seconds = Number(headers?.get?.("retry-after"));
+  return Number.isFinite(seconds) ? Math.max(0, Math.min(10_000, seconds * 1_000)) : 2_000;
+}
+
+function delay(ms) {
+  return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+}
+
+async function waitForAdmission(creds, initial) {
+  const admissionId = initial.json?.admission?.id;
+  const statusPath = initial.json?.status_url || initial.headers.get("location");
+  if (
+    typeof admissionId !== "string" || !admissionId ||
+    typeof statusPath !== "string" ||
+    !/^\/api\/agent\/admissions\/[A-Za-z0-9-]+$/.test(statusPath)
+  ) {
+    die("HTTP 202 did not include a valid admission id and same-site status URL.");
+  }
+  const configured = Number(process.env.LUGUO_ADMISSION_TIMEOUT_MS || 300_000);
+  const timeoutMs = Number.isFinite(configured)
+    ? Math.max(1_000, Math.min(900_000, configured))
+    : 300_000;
+  const deadline = Date.now() + timeoutMs;
+  let nextDelay = admissionRetryMs(initial.headers);
+  info(`Admission ${admissionId} queued; waiting for the automatic gate…`);
+  for (let attempt = 0; attempt < 300 && Date.now() < deadline; attempt += 1) {
+    await delay(nextDelay);
+    const polled = await api(creds, "GET", statusPath, { returnMeta: true });
+    if (polled.status === 200) return polled.json;
+    if (polled.status !== 202) {
+      die(`Expected HTTP 200 or 202 from GET ${statusPath}, received HTTP ${polled.status}.`);
+    }
+    nextDelay = admissionRetryMs(polled.headers);
+  }
+  die(
+    `Admission ${admissionId} is still running after ${Math.round(timeoutMs / 1_000)}s. ` +
+    "The server will continue automatically; rerun the same publish command to resume safely.",
+  );
+}
+
+async function waitForBookPublication(creds, initial, bookId) {
+  const runId = initial.json?.publication?.id;
+  const statusPath = initial.json?.status_url || initial.headers.get("location");
+  const expectedPath = new RegExp(
+    `^/api/books/${String(bookId).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/publications/[A-Za-z0-9-]+$`,
+  );
+  if (
+    typeof runId !== "string" || !runId ||
+    typeof statusPath !== "string" || !expectedPath.test(statusPath)
+  ) {
+    die("HTTP 202 did not include a valid publication run and same-book status URL.");
+  }
+  const configured = Number(
+    process.env.LUGUO_PUBLICATION_TIMEOUT_MS || process.env.LUGUO_ADMISSION_TIMEOUT_MS || 300_000,
+  );
+  const timeoutMs = Number.isFinite(configured)
+    ? Math.max(1_000, Math.min(900_000, configured))
+    : 300_000;
+  const deadline = Date.now() + timeoutMs;
+  let nextDelay = admissionRetryMs(initial.headers);
+  info(`Publication ${runId} queued; waiting for the atomic book commit…`);
+  for (let attempt = 0; attempt < 300 && Date.now() < deadline; attempt += 1) {
+    await delay(nextDelay);
+    const polled = await api(creds, "GET", statusPath, { returnMeta: true });
+    if (polled.status === 200) {
+      if (polled.json?.publication?.status !== "committed" || !polled.json?.book?.id) {
+        die(`Book publication ${runId} returned HTTP 200 without a committed receipt.`);
+      }
+      return polled.json;
+    }
+    if (polled.status !== 202) {
+      die(`Expected HTTP 200 or 202 from GET ${statusPath}, received HTTP ${polled.status}.`);
+    }
+    nextDelay = admissionRetryMs(polled.headers);
+  }
+  die(
+    `Book publication ${runId} is still running after ${Math.round(timeoutMs / 1_000)}s. ` +
+    "The server will continue automatically; rerun the same publish command to resume safely.",
+  );
+}
+
+async function publishApi(creds, method, path, body, {
+  expectedStatus,
+  awaitAdmission = false,
+  awaitBookPublication = null,
+} = {}) {
+  const request = {
+    body,
+    idempotencyKey: stableIdempotencyKey(creds, method, path, body),
+  };
+  if (!awaitAdmission && !awaitBookPublication) {
+    return api(creds, method, path, { ...request, expectedStatus });
+  }
+  const response = await api(creds, method, path, { ...request, returnMeta: true });
+  if (awaitAdmission) {
+    if (response.status === 201) return response.json;
+    if (response.status === 202) return waitForAdmission(creds, response);
+  } else {
+    if (response.status === 200) {
+      if (response.json?.publication?.status !== "committed" || !response.json?.book?.id) {
+        die("Book publication returned HTTP 200 without a committed receipt.");
+      }
+      return response.json;
+    }
+    if (response.status === 202) {
+      return waitForBookPublication(creds, response, awaitBookPublication);
+    }
+  }
+  const expected = awaitAdmission ? "HTTP 201 or 202" : "HTTP 200 or 202";
+  die(
+    `Expected ${expected} from ${method} ${path}, received HTTP ${response.status}. ` +
+    "The content was not accepted into the admission pipeline.",
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +433,48 @@ function printValidation(out, label) {
   return !!out.valid;
 }
 
+const ADMISSION_INDEX_COUNTS = ["teaches", "prereqs", "atoms", "bindings", "prereqEdges"];
+
+function requireReadyAdmission(out, label) {
+  const admission = out?.admission;
+  if (!admission || typeof admission !== "object" || Array.isArray(admission)) {
+    die(`${label} returned HTTP 201 without an admission receipt.`);
+  }
+  const required = ["id", "content_version_id", "content_hash", "gate_version"];
+  const missing = required.filter((key) => typeof admission[key] !== "string" || !admission[key]);
+  if (missing.length) {
+    die(`${label} returned an incomplete admission receipt (missing: ${missing.join(", ")}).`);
+  }
+  if (admission.status !== "ready") {
+    die(`${label} admission is ${String(admission.status || "unknown")}, not ready.`);
+  }
+  if (!Number.isInteger(admission.repairs) || admission.repairs < 0) {
+    die(`${label} admission receipt has an invalid repairs count.`);
+  }
+  const index = admission.index;
+  if (!index || typeof index !== "object" || Array.isArray(index)) {
+    die(`${label} admission receipt is missing index counts.`);
+  }
+  const invalidCounts = ADMISSION_INDEX_COUNTS.filter(
+    (key) => !Number.isInteger(index[key]) || index[key] < 0,
+  );
+  if (invalidCounts.length) {
+    die(`${label} admission has invalid index count(s): ${invalidCounts.join(", ")}.`);
+  }
+  if (index.teaches < 1 || index.bindings < 1) {
+    die(`${label} admission is not algorithm-ready (teaches=${index.teaches}, bindings=${index.bindings}).`);
+  }
+  return admission;
+}
+
+function printAdmission(admission) {
+  const index = admission.index;
+  info(`  gate    ${admission.gate_version} (${admission.status}, ${admission.repairs} repair(s))`);
+  info(`  index   ${ADMISSION_INDEX_COUNTS.map((key) => `${key}×${index[key]}`).join(" ")}`);
+  info(`  version ${c.cyan(admission.content_version_id)}`);
+  info(`  hash    ${c.dim(admission.content_hash)}`);
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 
@@ -311,11 +534,31 @@ visibility: private
 - **概念 A**: 一句话定义
 :::
 
-:::quiz 一道检查题?
+:::quiz 检查题一?
 - [x] 正确选项
 - [ ] 错误选项
 @id q-demo-1
 @explain 为什么正确选项对。
+@skills 概念 A
+@steps 识别条件,应用概念 A,检查结论
+:::
+
+:::quiz 检查题二?
+- [ ] 常见误解
+- [x] 正确结论
+@id q-demo-2
+@explain 用另一个场景确认概念 A。
+@skills 概念 A
+@steps 提取信息,比较选项,验证答案
+:::
+
+:::quiz 检查题三?
+- [x] 可以迁移到新场景的结论
+- [ ] 只复述题面但不成立的结论
+@id q-demo-3
+@explain 把概念 A 迁移到新场景仍得到同一规则。
+@skills 概念 A
+@steps 识别新场景,迁移规则,反例检查
 :::
 `;
 
@@ -364,27 +607,34 @@ async function cmdValidate(args) {
 
 async function publishLessonFile(creds, path, args) {
   const lesson = loadLessonFile(path);
-  const out = await api(creds, "POST", "/api/agent/lessons", {
-    body: {
-      title: String(args.title || lesson.title),
-      summary: args.summary !== undefined ? String(args.summary) : lesson.summary,
-      tags: normTags(args.tags) ?? lesson.tags,
-      visibility: VISIBILITIES.includes(args.visibility) ? args.visibility : lesson.visibility,
-      language: lesson.language,
-      cover_emoji: args.emoji ? String(args.emoji) : lesson.emoji,
-      body: { format: "luma-md-v1", markdown: lesson.markdown },
-    },
+  const payload = {
+    title: String(args.title || lesson.title),
+    summary: args.summary !== undefined ? String(args.summary) : lesson.summary,
+    tags: normTags(args.tags) ?? lesson.tags,
+    visibility: VISIBILITIES.includes(args.visibility) ? args.visibility : lesson.visibility,
+    language: lesson.language,
+    cover_emoji: args.emoji ? String(args.emoji) : lesson.emoji,
+    body: { format: "luma-md-v1", markdown: lesson.markdown },
+  };
+  const out = await publishApi(creds, "POST", "/api/agent/lessons", payload, {
+    expectedStatus: 201,
+    awaitAdmission: true,
   });
+  const admission = requireReadyAdmission(out, `Lesson "${lesson.title}"`);
   const url = absoluteUrl(creds, out.lesson?.url);
   saveProjectState(dirname(path), {
     lesson_id: out.lesson?.id || null,
     lesson_slug: out.lesson?.slug || null,
     url,
+    admission,
     published_at: new Date().toISOString(),
   });
   ok(`Lesson published: ${lesson.title}`);
-  info(`  blocks  ${out.blocks} (${Object.entries(out.block_counts || {}).map(([k, n]) => `${k}×${n}`).join(" ")})`);
-  info(`  scenes  ${out.scenes}`);
+  printAdmission(admission);
+  if (Number.isInteger(out.blocks)) {
+    info(`  blocks  ${out.blocks} (${Object.entries(out.block_counts || {}).map(([k, n]) => `${k}×${n}`).join(" ")})`);
+  }
+  if (Number.isInteger(out.scenes)) info(`  scenes  ${out.scenes}`);
   info(`  url     ${c.cyan(url)}`);
 }
 
@@ -395,33 +645,54 @@ async function publishBookDir(creds, root, args) {
 
   // Create the book container private first; flip visibility once at the end
   // so the publish cascade covers every chapter lesson in one go.
-  const created = await api(creds, "POST", "/api/books", {
-    body: {
-      title: String(args.title || book.title),
-      subtitle: book.subtitle,
-      summary: String(args.summary ?? book.summary ?? ""),
-      tags: normTags(args.tags) ?? book.tags,
-      visibility: "private",
-      cover_emoji: args.emoji ? String(args.emoji) : book.emoji,
-      language: book.language,
-    },
-  });
+  const createPayload = {
+    title: String(args.title || book.title),
+    subtitle: book.subtitle,
+    summary: String(args.summary ?? book.summary ?? ""),
+    tags: normTags(args.tags) ?? book.tags,
+    visibility: "private",
+    cover_emoji: args.emoji ? String(args.emoji) : book.emoji,
+    language: book.language,
+  };
+  const created = await publishApi(creds, "POST", "/api/books", createPayload);
   const bookId = created.book?.id;
   if (!bookId) die("Server did not return a book id.");
 
   const published = [];
   let course = null;
   for (const chapter of book.chapters) {
-    const out = await api(creds, "POST", `/api/books/${bookId}/chapters`, {
-      body: { title: chapter.title, summary: chapter.summary ?? "", markdown: chapter.markdown },
+    const chapterPath = `/api/books/${bookId}/chapters`;
+    const chapterPayload = {
+      title: chapter.title,
+      summary: chapter.summary ?? "",
+      markdown: chapter.markdown,
+    };
+    const out = await publishApi(creds, "POST", chapterPath, chapterPayload, {
+      expectedStatus: 201,
+      awaitAdmission: true,
     });
-    published.push({ source: chapter.source, chapter_id: out.chapter?.id, lesson_id: out.lesson?.id, lesson_slug: out.lesson?.slug });
+    const admission = requireReadyAdmission(out, `Chapter "${chapter.title}"`);
+    published.push({
+      source: chapter.source,
+      chapter_id: out.chapter?.id,
+      lesson_id: out.lesson?.id,
+      lesson_slug: out.lesson?.slug,
+      admission,
+    });
     if (out.course) course = out.course;
-    info(`  ${c.green("+")} ${chapter.source} → ${chapter.title}`);
+    info(`  ${c.green("+")} ${chapter.source} → ${chapter.title} ${c.dim(`(${admission.gate_version}, ready)`)}`);
   }
 
+  let publication = null;
   if (visibility !== "private") {
-    await api(creds, "PATCH", `/api/books/${bookId}`, { body: { visibility } });
+    const publicationResult = await publishApi(
+      creds,
+      "PATCH",
+      `/api/books/${bookId}`,
+      { visibility },
+      { awaitBookPublication: bookId },
+    );
+    publication = publicationResult.publication;
   }
 
   const workspaceUrl = absoluteUrl(creds, `/create/${bookId}`);
@@ -433,6 +704,7 @@ async function publishBookDir(creds, root, args) {
     url: readerUrl,
     workspace_url: workspaceUrl,
     chapters: published,
+    publication,
     published_at: new Date().toISOString(),
   });
   ok(`Book published: ${book.title} (${published.length} chapter(s), ${visibility})`);
@@ -525,8 +797,8 @@ Usage:
   luguo skill [--save]                           fetch the luma-md guide (/skill.md)
   luguo init [lesson.md]                         create a lesson template
   luguo init book [dir]                          create a book project (luguo.yml + chapters)
-  luguo validate <file.md | dir>                 server-side validation
-  luguo publish <file.md | dir>                  file → lesson, directory → book
+  luguo validate <file.md | dir>                 preview server-side validation
+  luguo publish <file.md | dir>                  automatic admission gate, then publish
       [--title T] [--summary S] [--tags a,b] [--visibility private|unlisted|public] [--emoji E]
   luguo lessons                                  list your published lessons
   luguo books                                    list your books
@@ -536,6 +808,10 @@ Usage:
 A lesson is one .md file: YAML frontmatter (title/summary/tags/visibility/
 language/emoji) + a luma-md body. A book is a directory: optional luguo.yml
 (same fields + chapters list) + one .md per chapter, sorted by filename.
+Every publish is cleaned, structurally checked, semantically aligned, and
+indexed by the server. HTTP 202 is followed until the durable admission is ready;
+success still requires a complete ready receipt. Stable Idempotency-Key headers
+make unchanged retries safe from duplicates.
 Env: LUGUO_API_KEY, LUGUO_BASE_URL override saved credentials.`);
 }
 

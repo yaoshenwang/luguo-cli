@@ -27,8 +27,30 @@ A line passes through (0, 1) and (2, 5). What is its slope?
 - [ ] the line is horizontal
 - [x] the line falls from left to right
 - [ ] the line must pass through the origin
+@id q-slope-sign
 @explain When k < 0, y decreases as x increases, so the line goes downhill.
 @skills slope-sign
+@steps inspect the sign of k,relate x and y changes,match the graph direction
+:::
+
+:::quiz What is the slope through (0, 1) and (2, 5)?
+- [ ] 1
+- [x] 2
+- [ ] 4
+@id q-slope-two-points
+@explain The slope is (5 - 1) / (2 - 0) = 2.
+@skills slope-from-points
+@steps calculate delta y,calculate delta x,divide delta y by delta x
+:::
+
+:::quiz Which equation has a horizontal graph?
+- [x] y = 3
+- [ ] y = 3x
+- [ ] x = 3
+@id q-slope-zero
+@explain A horizontal line has slope zero, so y is constant.
+@skills slope-sign
+@steps identify a constant y-value,infer zero slope,exclude vertical lines
 :::
 
 :::tip Mnemonic
