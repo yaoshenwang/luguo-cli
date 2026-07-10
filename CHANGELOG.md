@@ -4,6 +4,17 @@ All notable changes to `luguo-cli` are documented here. This project follows
 [Semantic Versioning](https://semver.org/) and the
 [Keep a Changelog](https://keepachangelog.com/) format.
 
+## [0.1.6] - 2026-07-10
+
+### Changed
+- `publish` is now fail-closed on the unified admission gate. A lesson or non-empty chapter is successful only after HTTP `201` returns a complete `admission` receipt with `status: "ready"`, `teaches >= 1`, and `bindings >= 1`.
+- HTTP `422` output now lists every admission issue with its content path and machine-readable code.
+- `.luguo/state.json` now records the full admission receipt for a lesson or for every published book chapter.
+
+### Added
+- Stable, credential-namespaced `Idempotency-Key` headers for all mutating publish requests, derived from the site, method, endpoint, and canonical payload so unchanged retries do not create duplicates or collide across agents.
+- Zero-dependency Node test coverage for help, doctor, validation, lesson and book admission, 201/422 handling, fail-closed readiness checks, persisted receipts, and idempotent retries.
+
 ## [0.1.5] - 2026-07-03
 
 ### Changed
@@ -73,6 +84,8 @@ First public release.
 - Zero runtime dependencies (pure Node ≥ 18, using the global `fetch` and `node:` builtins).
 - Credentials stored at `~/.config/luguo/credentials.json` with `0600` permissions.
 
+[0.1.6]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.5...v0.1.6
+[0.1.5]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.1...v0.1.2
