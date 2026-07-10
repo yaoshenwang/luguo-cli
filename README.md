@@ -52,6 +52,30 @@ visibility: private
 - [x] 直线下降
 @id q-slope-sign
 @explain k < 0 时 x 增大 y 减小。
+@skills 斜率符号
+@steps 读取 k 的符号,判断 y 的变化方向,检查图像趋势
+:::
+
+:::quiz k = 0 时直线怎样?
+- [x] 水平
+- [ ] 竖直
+@id q-slope-zero
+@explain y 不随 x 变化，所以直线水平。
+@skills 斜率符号
+@steps 代入 k=0,化简函数,匹配图像
+:::
+
+:::quiz 哪条直线随 x 增大而上升?
+- [ ] k = -2
+- [x] k = 2
+@id q-slope-positive
+@explain 正斜率表示 y 随 x 增大而增大。
+@skills 斜率符号
+@steps 比较斜率符号,判断变化方向,排除反例
+:::
+
+:::keypoints
+- **斜率符号**: 正斜率上升，负斜率下降，零斜率水平。
 :::
 ```
 
@@ -99,9 +123,13 @@ each lesson and each non-empty chapter, luguo:
 3. creates an immutable content version and content hash;
 4. indexes the content into the learning graph.
 
-The CLI reports success only when the API returns HTTP `201` with
-`admission.status: "ready"`, at least one taught topic, and at least one graph
-binding. A successful receipt looks like this:
+The server may return HTTP `202` while a durable worker finishes the gate. The
+CLI follows the same-site admission URL (honouring `Retry-After`) for up to five
+minutes; the server keeps working if that local wait expires, and rerunning the
+unchanged command resumes safely. The CLI reports success only after HTTP `201`
+or the follow-up HTTP `200` contains `admission.status: "ready"`, at least one
+taught topic, and at least one graph binding. A successful receipt looks like
+this:
 
 ```json
 {
@@ -125,13 +153,19 @@ HTTP `422` means the content was not admitted. The CLI prints every gate issue
 with its path and code so an agent can repair the source and retry; it does not
 print a success message or record a successful state.
 
+For a public or unlisted book, chapter admissions are only the first phase. The
+final visibility flip runs as one atomic publication saga. If it returns HTTP
+`202`, the CLI follows `/api/books/<book>/publications/<run>` until HTTP `200`
+contains `publication.status: "committed"`; HTTP `422` fails the command. The
+committed publication receipt is stored at `publication` in project state.
+
 Every mutating request made by `publish` carries a deterministic
 `Idempotency-Key` derived from the site, a one-way credential namespace, the
 method, endpoint, and canonical payload.
 Retrying unchanged content is therefore safe and does not create duplicates;
 changing the content or metadata produces a new key. `.luguo/state.json` keeps
 the full receipt at `admission` for one lesson and at
-`chapters[].admission` for a book.
+`chapters[].admission` for a book, plus the book-level atomic `publication`.
 
 ## Commands
 

@@ -41,6 +41,29 @@ visibility: private
 @id q-mock-1
 @explain The grounded answer is correct.
 @skills mock-skill
+@steps identify the condition,apply the rule,check the result
+:::
+
+:::quiz Which second answer is grounded?
+- [ ] The unsupported answer
+- [x] The second grounded answer
+@id q-mock-2
+@explain The second grounded answer follows the lesson.
+@skills mock-skill
+@steps read the evidence,compare the choices,verify the conclusion
+:::
+
+:::quiz Which answer transfers the idea?
+- [x] The valid transfer
+- [ ] The superficial match
+@id q-mock-3
+@explain The valid transfer preserves the taught rule.
+@skills mock-skill
+@steps recognize the new context,transfer the rule,test a counterexample
+:::
+
+:::keypoints
+- **mock-skill**: A grounded conclusion must follow the lesson evidence.
 :::
 `;
 
@@ -75,8 +98,8 @@ async function readJsonBody(req) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8") || "null");
 }
 
-function sendJson(res, status, body) {
-  res.writeHead(status, { "content-type": "application/json" });
+function sendJson(res, status, body, headers = {}) {
+  res.writeHead(status, { "content-type": "application/json", ...headers });
   res.end(JSON.stringify(body));
 }
 
@@ -115,6 +138,28 @@ test("help documents automatic admission", async () => {
   }
 });
 
+test("init creates an admission-ready structural template", async () => {
+  const { root, home } = await tempProject();
+  const lessonPath = join(root, "ready-template.md");
+  try {
+    const out = await runCli(["init", lessonPath], {
+      cwd: root,
+      home,
+      baseUrl: "http://127.0.0.1:1",
+      key: "",
+    });
+    assert.equal(out.code, 0);
+    const markdown = await readFile(lessonPath, "utf8");
+    assert.equal((markdown.match(/^:::quiz\b/gm) || []).length, 3);
+    assert.equal((markdown.match(/^@id\s+/gm) || []).length, 3);
+    assert.equal((markdown.match(/^@skills\s+/gm) || []).length, 3);
+    assert.equal((markdown.match(/^@steps\s+/gm) || []).length, 3);
+    assert.match(markdown, /^:::keypoints\b/m);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("doctor can check a mock server without reading real credentials", async () => {
   const { root, home } = await tempProject();
   try {
@@ -124,7 +169,7 @@ test("doctor can check a mock server without reading real credentials", async ()
       res.end("# Mock skill\n");
     }, async (baseUrl) => {
       const out = await runCli(["doctor"], { cwd: root, home, baseUrl, key: "" });
-      assert.equal(out.code, 0);
+      assert.equal(out.code, 0, out.stderr);
       assert.match(out.stdout, /OK\s+GET .*\/skill\.md \(200\)/);
       assert.match(out.stdout, /No API key saved/);
     });
@@ -207,6 +252,63 @@ test("lesson publish requires 201 ready, persists admission, and reuses a stable
     const state = JSON.parse(await readFile(join(root, ".luguo", "state.json"), "utf8"));
     assert.deepEqual(state.admission, READY_ADMISSION);
     assert.equal(state.lesson_id, "lesson_test_1");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lesson publish follows a durable 202 admission until it is ready", async () => {
+  const { root, home } = await tempProject();
+  const lessonPath = join(root, "lesson.md");
+  await writeFile(lessonPath, LESSON);
+  let posts = 0;
+  let polls = 0;
+  try {
+    await withMock((req, res) => {
+      if (req.method === "POST" && req.url === "/api/agent/lessons") {
+        posts += 1;
+        assert.match(String(req.headers["idempotency-key"]), /^luguo-cli-v1-[a-f0-9]{64}$/);
+        res.writeHead(202, {
+          "content-type": "application/json",
+          "retry-after": "0",
+          location: "/api/agent/admissions/11111111-1111-4111-8111-111111111111",
+        });
+        res.end(JSON.stringify({
+          queued: true,
+          admission: { id: "11111111-1111-4111-8111-111111111111", status: "validating" },
+          status_url: "/api/agent/admissions/11111111-1111-4111-8111-111111111111",
+        }));
+        return;
+      }
+      if (req.method === "GET" && req.url === "/api/agent/admissions/11111111-1111-4111-8111-111111111111") {
+        polls += 1;
+        assert.equal(req.headers.authorization, `Bearer ${TEST_KEY}`);
+        if (polls === 1) {
+          res.writeHead(202, { "content-type": "application/json", "retry-after": "0" });
+          res.end(JSON.stringify({
+            queued: true,
+            admission: { id: "11111111-1111-4111-8111-111111111111", status: "indexing" },
+          }));
+          return;
+        }
+        sendJson(res, 200, {
+          lesson: { id: "lesson_queued_1", slug: "queued-ready", url: "/lessons/queued-ready" },
+          admission: { ...READY_ADMISSION, id: "11111111-1111-4111-8111-111111111111" },
+        });
+        return;
+      }
+      sendJson(res, 404, { error: "Not found" });
+    }, async (baseUrl) => {
+      const out = await runCli(["publish", lessonPath], { cwd: root, home, baseUrl });
+      assert.equal(out.code, 0, out.stderr);
+      assert.match(out.stdout, /Admission 11111111-1111-4111-8111-111111111111 queued; waiting for the automatic gate/);
+      assert.match(out.stdout, /Lesson published: Mock admission lesson/);
+    });
+    assert.equal(posts, 1);
+    assert.equal(polls, 2);
+    const state = JSON.parse(await readFile(join(root, ".luguo", "state.json"), "utf8"));
+    assert.equal(state.admission.id, "11111111-1111-4111-8111-111111111111");
+    assert.equal(state.admission.status, "ready");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -325,7 +427,10 @@ test("book chapters pass the same gate and retain per-chapter admission receipts
         return;
       }
       if (req.method === "PATCH" && req.url === "/api/books/book_test_1") {
-        sendJson(res, 200, { ok: true });
+        sendJson(res, 200, {
+          publication: { id: "pub_committed_1", status: "committed" },
+          book: { id: "book_test_1", slug: "mock-book", visibility: "unlisted" },
+        });
         return;
       }
       sendJson(res, 404, { error: "Not found" });
@@ -343,6 +448,120 @@ test("book chapters pass the same gate and retain per-chapter admission receipts
     }
     const state = JSON.parse(await readFile(join(bookRoot, ".luguo", "state.json"), "utf8"));
     assert.deepEqual(state.chapters[0].admission, READY_ADMISSION);
+    assert.equal(state.publication.status, "committed");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("book publish follows a 202 publication saga through atomic commit", async () => {
+  const { root, home } = await tempProject();
+  const bookRoot = join(root, "book");
+  await mkdir(bookRoot);
+  await writeFile(join(bookRoot, "luguo.yml"), "title: Saga book\nvisibility: public\nlanguage: en\n");
+  await writeFile(join(bookRoot, "01-chapter.md"), LESSON);
+  let polls = 0;
+  try {
+    await withMock(async (req, res) => {
+      if (req.method === "POST" && req.url === "/api/books") {
+        sendJson(res, 200, { book: { id: "book_saga_1", slug: "saga-book" } });
+        return;
+      }
+      if (req.method === "POST" && req.url === "/api/books/book_saga_1/chapters") {
+        sendJson(res, 201, {
+          chapter: { id: "chapter_saga_1", lesson_id: "lesson_saga_1" },
+          lesson: { id: "lesson_saga_1", slug: "saga-chapter" },
+          course: { id: "course_saga_1", slug: "saga-course" },
+          admission: READY_ADMISSION,
+        });
+        return;
+      }
+      if (req.method === "PATCH" && req.url === "/api/books/book_saga_1") {
+        sendJson(res, 202, {
+          queued: true,
+          publication: { id: "11111111-1111-4111-8111-111111111111", status: "validating" },
+          status_url: "/api/books/book_saga_1/publications/11111111-1111-4111-8111-111111111111",
+        }, { location: "/api/books/book_saga_1/publications/11111111-1111-4111-8111-111111111111", "retry-after": "0" });
+        return;
+      }
+      if (req.method === "GET" && req.url === "/api/books/book_saga_1/publications/11111111-1111-4111-8111-111111111111") {
+        polls += 1;
+        if (polls === 1) {
+          sendJson(res, 202, {
+            queued: true,
+            publication: { id: "11111111-1111-4111-8111-111111111111", status: "committing" },
+          }, { "retry-after": "0" });
+          return;
+        }
+        sendJson(res, 200, {
+          publication: { id: "11111111-1111-4111-8111-111111111111", status: "committed" },
+          book: { id: "book_saga_1", slug: "saga-book", visibility: "public" },
+        });
+        return;
+      }
+      sendJson(res, 404, { error: "Not found" });
+    }, async (baseUrl) => {
+      const out = await runCli(["publish", bookRoot], { cwd: root, home, baseUrl });
+      assert.equal(out.code, 0, out.stderr);
+      assert.match(out.stdout, /Publication 11111111-1111-4111-8111-111111111111 queued/);
+      assert.match(out.stdout, /Book published: Saga book/);
+    });
+    assert.equal(polls, 2);
+    const state = JSON.parse(await readFile(join(bookRoot, ".luguo", "state.json"), "utf8"));
+    assert.deepEqual(state.publication, {
+      id: "11111111-1111-4111-8111-111111111111",
+      status: "committed",
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("book publication saga fails closed when its status endpoint returns 422", async () => {
+  const { root, home } = await tempProject();
+  const bookRoot = join(root, "book");
+  await mkdir(bookRoot);
+  await writeFile(join(bookRoot, "luguo.yml"), "title: Rejected book\nvisibility: public\nlanguage: en\n");
+  await writeFile(join(bookRoot, "01-chapter.md"), LESSON);
+  const runId = "22222222-2222-4222-8222-222222222222";
+  try {
+    await withMock(async (req, res) => {
+      if (req.method === "POST" && req.url === "/api/books") {
+        sendJson(res, 200, { book: { id: "book_rejected_1", slug: "rejected-book" } });
+        return;
+      }
+      if (req.method === "POST" && req.url === "/api/books/book_rejected_1/chapters") {
+        sendJson(res, 201, {
+          chapter: { id: "chapter_rejected_1", lesson_id: "lesson_rejected_1" },
+          lesson: { id: "lesson_rejected_1", slug: "rejected-chapter" },
+          course: { id: "course_rejected_1", slug: "rejected-course" },
+          admission: READY_ADMISSION,
+        });
+        return;
+      }
+      if (req.method === "PATCH" && req.url === "/api/books/book_rejected_1") {
+        const statusUrl = `/api/books/book_rejected_1/publications/${runId}`;
+        sendJson(res, 202, {
+          queued: true,
+          publication: { id: runId, status: "validating" },
+          status_url: statusUrl,
+        }, { location: statusUrl, "retry-after": "0" });
+        return;
+      }
+      if (req.method === "GET" && req.url === `/api/books/book_rejected_1/publications/${runId}`) {
+        sendJson(res, 422, {
+          error: "chapter admission failed",
+          publication: { id: runId, status: "failed" },
+        });
+        return;
+      }
+      sendJson(res, 404, { error: "Not found" });
+    }, async (baseUrl) => {
+      const out = await runCli(["publish", bookRoot], { cwd: root, home, baseUrl });
+      assert.equal(out.code, 1);
+      assert.match(out.stderr, /HTTP 422: chapter admission failed/);
+    });
+    await assert.rejects(readFile(join(bookRoot, ".luguo", "state.json"), "utf8"), /ENOENT/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

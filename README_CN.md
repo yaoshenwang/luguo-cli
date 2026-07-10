@@ -51,6 +51,30 @@ visibility: private
 - [x] 直线下降
 @id q-slope-sign
 @explain k < 0 时 x 增大 y 减小。
+@skills 斜率符号
+@steps 读取 k 的符号,判断 y 的变化方向,检查图像趋势
+:::
+
+:::quiz k = 0 时直线怎样?
+- [x] 水平
+- [ ] 竖直
+@id q-slope-zero
+@explain y 不随 x 变化，所以直线水平。
+@skills 斜率符号
+@steps 代入 k=0,化简函数,匹配图像
+:::
+
+:::quiz 哪条直线随 x 增大而上升?
+- [ ] k = -2
+- [x] k = 2
+@id q-slope-positive
+@explain 正斜率表示 y 随 x 增大而增大。
+@skills 斜率符号
+@steps 比较斜率符号,判断变化方向,排除反例
+:::
+
+:::keypoints
+- **斜率符号**: 正斜率上升，负斜率下降，零斜率水平。
 :::
 ```
 
@@ -97,8 +121,11 @@ emoji: 📈
 3. 创建不可变的内容版本与内容哈希；
 4. 将内容索引进学习图谱。
 
-只有 API 返回 HTTP `201`，且 `admission.status` 为 `"ready"`、至少教一个
-主题、至少产生一个图谱绑定时，CLI 才会报告成功。成功凭证形如：
+服务端可能先返回 HTTP `202`，由 durable worker 继续完成门禁。CLI 会遵循同站
+admission URL 与 `Retry-After` 最多等待五分钟；本地等待超时后服务端仍会继续，
+不改内容重跑同一命令即可安全恢复。只有首个 HTTP `201` 或后续 HTTP `200` 中的
+`admission.status` 为 `"ready"`、至少教一个主题且至少产生一个图谱绑定时，CLI
+才会报告成功。成功凭证形如：
 
 ```json
 {
@@ -121,10 +148,17 @@ emoji: 📈
 HTTP `422` 表示内容未获准入。CLI 会逐条打印门禁问题的路径与代码，便于
 agent 修改源文件后重试；此时既不会输出成功，也不会记录成功状态。
 
+对于公开或不公开列出的书，章节逐一准入只是第一阶段。最终可见性切换由一个
+原子 publication saga 完成；若先返回 HTTP `202`，CLI 会沿
+`/api/books/<book>/publications/<run>` 自动等待，直到 HTTP `200` 明确返回
+`publication.status: "committed"`。HTTP `422` 会让命令失败；最终提交凭证写入
+项目状态的 `publication`。
+
 `publish` 发出的每个写请求都会携带稳定的 `Idempotency-Key`，它由站点、凭据的
 单向命名空间、请求方法、端点和规范化 payload 确定。同一内容不变地重试不会产生
 重复数据；内容或元数据发生变化时会生成新 key。单课的完整凭证保存在 `.luguo/state.json` 的
 `admission`，书籍则保存在各个 `chapters[].admission`。
+书籍的原子发布凭证另存于 `publication`。
 
 ## 命令
 

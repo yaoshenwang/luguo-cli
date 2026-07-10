@@ -7,13 +7,16 @@ All notable changes to `luguo-cli` are documented here. This project follows
 ## [0.1.6] - 2026-07-10
 
 ### Changed
-- `publish` is now fail-closed on the unified admission gate. A lesson or non-empty chapter is successful only after HTTP `201` returns a complete `admission` receipt with `status: "ready"`, `teaches >= 1`, and `bindings >= 1`.
+- `publish` is now fail-closed on the unified admission gate. A lesson or non-empty chapter is successful only after HTTP `201`, or a polled HTTP `200`, returns a complete `admission` receipt with `status: "ready"`, `teaches >= 1`, and `bindings >= 1`.
+- HTTP `202` admissions are now followed through their same-site status URL until ready or rejected; a bounded local timeout never cancels the durable server job, and the stable publish key makes a later rerun resume safely.
+- Public/unlisted books now follow the book publication saga through HTTP `202` to a fail-closed `committed` receipt, which is persisted in `.luguo/state.json`.
+- `init` and all bundled lesson/book examples now satisfy the production-ready baseline of three quizzes, stable IDs, `@skills`, `@steps`, explanations, and keypoints.
 - HTTP `422` output now lists every admission issue with its content path and machine-readable code.
 - `.luguo/state.json` now records the full admission receipt for a lesson or for every published book chapter.
 
 ### Added
 - Stable, credential-namespaced `Idempotency-Key` headers for all mutating publish requests, derived from the site, method, endpoint, and canonical payload so unchanged retries do not create duplicates or collide across agents.
-- Zero-dependency Node test coverage for help, doctor, validation, lesson and book admission, 201/422 handling, fail-closed readiness checks, persisted receipts, and idempotent retries.
+- Zero-dependency Node test coverage for help, doctor, validation, admission-ready templates, lesson and book admission, 201/202/422 handling, fail-closed readiness checks, persisted receipts, polling, and idempotent retries.
 
 ## [0.1.5] - 2026-07-03
 

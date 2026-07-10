@@ -155,6 +155,7 @@ async function api(creds, method, path, {
   auth = true,
   expectedStatus,
   idempotencyKey,
+  returnMeta = false,
 } = {}) {
   const headers = { "content-type": "application/json" };
   if (auth) headers.authorization = `Bearer ${requireKey(creds)}`;
@@ -180,15 +181,123 @@ async function api(creds, method, path, {
   if (expectedStatus !== undefined && res.status !== expectedStatus) {
     die(`Expected HTTP ${expectedStatus} from ${method} ${path}, received HTTP ${res.status}. The content was not accepted as ready.`);
   }
-  return json;
+  return returnMeta ? { json, status: res.status, headers: res.headers } : json;
 }
 
-function publishApi(creds, method, path, body, { expectedStatus } = {}) {
-  return api(creds, method, path, {
+function admissionRetryMs(headers) {
+  const seconds = Number(headers?.get?.("retry-after"));
+  return Number.isFinite(seconds) ? Math.max(0, Math.min(10_000, seconds * 1_000)) : 2_000;
+}
+
+function delay(ms) {
+  return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+}
+
+async function waitForAdmission(creds, initial) {
+  const admissionId = initial.json?.admission?.id;
+  const statusPath = initial.json?.status_url || initial.headers.get("location");
+  if (
+    typeof admissionId !== "string" || !admissionId ||
+    typeof statusPath !== "string" ||
+    !/^\/api\/agent\/admissions\/[A-Za-z0-9-]+$/.test(statusPath)
+  ) {
+    die("HTTP 202 did not include a valid admission id and same-site status URL.");
+  }
+  const configured = Number(process.env.LUGUO_ADMISSION_TIMEOUT_MS || 300_000);
+  const timeoutMs = Number.isFinite(configured)
+    ? Math.max(1_000, Math.min(900_000, configured))
+    : 300_000;
+  const deadline = Date.now() + timeoutMs;
+  let nextDelay = admissionRetryMs(initial.headers);
+  info(`Admission ${admissionId} queued; waiting for the automatic gate…`);
+  for (let attempt = 0; attempt < 300 && Date.now() < deadline; attempt += 1) {
+    await delay(nextDelay);
+    const polled = await api(creds, "GET", statusPath, { returnMeta: true });
+    if (polled.status === 200) return polled.json;
+    if (polled.status !== 202) {
+      die(`Expected HTTP 200 or 202 from GET ${statusPath}, received HTTP ${polled.status}.`);
+    }
+    nextDelay = admissionRetryMs(polled.headers);
+  }
+  die(
+    `Admission ${admissionId} is still running after ${Math.round(timeoutMs / 1_000)}s. ` +
+    "The server will continue automatically; rerun the same publish command to resume safely.",
+  );
+}
+
+async function waitForBookPublication(creds, initial, bookId) {
+  const runId = initial.json?.publication?.id;
+  const statusPath = initial.json?.status_url || initial.headers.get("location");
+  const expectedPath = new RegExp(
+    `^/api/books/${String(bookId).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/publications/[A-Za-z0-9-]+$`,
+  );
+  if (
+    typeof runId !== "string" || !runId ||
+    typeof statusPath !== "string" || !expectedPath.test(statusPath)
+  ) {
+    die("HTTP 202 did not include a valid publication run and same-book status URL.");
+  }
+  const configured = Number(
+    process.env.LUGUO_PUBLICATION_TIMEOUT_MS || process.env.LUGUO_ADMISSION_TIMEOUT_MS || 300_000,
+  );
+  const timeoutMs = Number.isFinite(configured)
+    ? Math.max(1_000, Math.min(900_000, configured))
+    : 300_000;
+  const deadline = Date.now() + timeoutMs;
+  let nextDelay = admissionRetryMs(initial.headers);
+  info(`Publication ${runId} queued; waiting for the atomic book commit…`);
+  for (let attempt = 0; attempt < 300 && Date.now() < deadline; attempt += 1) {
+    await delay(nextDelay);
+    const polled = await api(creds, "GET", statusPath, { returnMeta: true });
+    if (polled.status === 200) {
+      if (polled.json?.publication?.status !== "committed" || !polled.json?.book?.id) {
+        die(`Book publication ${runId} returned HTTP 200 without a committed receipt.`);
+      }
+      return polled.json;
+    }
+    if (polled.status !== 202) {
+      die(`Expected HTTP 200 or 202 from GET ${statusPath}, received HTTP ${polled.status}.`);
+    }
+    nextDelay = admissionRetryMs(polled.headers);
+  }
+  die(
+    `Book publication ${runId} is still running after ${Math.round(timeoutMs / 1_000)}s. ` +
+    "The server will continue automatically; rerun the same publish command to resume safely.",
+  );
+}
+
+async function publishApi(creds, method, path, body, {
+  expectedStatus,
+  awaitAdmission = false,
+  awaitBookPublication = null,
+} = {}) {
+  const request = {
     body,
-    expectedStatus,
     idempotencyKey: stableIdempotencyKey(creds, method, path, body),
-  });
+  };
+  if (!awaitAdmission && !awaitBookPublication) {
+    return api(creds, method, path, { ...request, expectedStatus });
+  }
+  const response = await api(creds, method, path, { ...request, returnMeta: true });
+  if (awaitAdmission) {
+    if (response.status === 201) return response.json;
+    if (response.status === 202) return waitForAdmission(creds, response);
+  } else {
+    if (response.status === 200) {
+      if (response.json?.publication?.status !== "committed" || !response.json?.book?.id) {
+        die("Book publication returned HTTP 200 without a committed receipt.");
+      }
+      return response.json;
+    }
+    if (response.status === 202) {
+      return waitForBookPublication(creds, response, awaitBookPublication);
+    }
+  }
+  const expected = awaitAdmission ? "HTTP 201 or 202" : "HTTP 200 or 202";
+  die(
+    `Expected ${expected} from ${method} ${path}, received HTTP ${response.status}. ` +
+    "The content was not accepted into the admission pipeline.",
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -425,11 +534,31 @@ visibility: private
 - **概念 A**: 一句话定义
 :::
 
-:::quiz 一道检查题?
+:::quiz 检查题一?
 - [x] 正确选项
 - [ ] 错误选项
 @id q-demo-1
 @explain 为什么正确选项对。
+@skills 概念 A
+@steps 识别条件,应用概念 A,检查结论
+:::
+
+:::quiz 检查题二?
+- [ ] 常见误解
+- [x] 正确结论
+@id q-demo-2
+@explain 用另一个场景确认概念 A。
+@skills 概念 A
+@steps 提取信息,比较选项,验证答案
+:::
+
+:::quiz 检查题三?
+- [x] 可以迁移到新场景的结论
+- [ ] 只复述题面但不成立的结论
+@id q-demo-3
+@explain 把概念 A 迁移到新场景仍得到同一规则。
+@skills 概念 A
+@steps 识别新场景,迁移规则,反例检查
 :::
 `;
 
@@ -489,6 +618,7 @@ async function publishLessonFile(creds, path, args) {
   };
   const out = await publishApi(creds, "POST", "/api/agent/lessons", payload, {
     expectedStatus: 201,
+    awaitAdmission: true,
   });
   const admission = requireReadyAdmission(out, `Lesson "${lesson.title}"`);
   const url = absoluteUrl(creds, out.lesson?.url);
@@ -501,8 +631,10 @@ async function publishLessonFile(creds, path, args) {
   });
   ok(`Lesson published: ${lesson.title}`);
   printAdmission(admission);
-  info(`  blocks  ${out.blocks} (${Object.entries(out.block_counts || {}).map(([k, n]) => `${k}×${n}`).join(" ")})`);
-  info(`  scenes  ${out.scenes}`);
+  if (Number.isInteger(out.blocks)) {
+    info(`  blocks  ${out.blocks} (${Object.entries(out.block_counts || {}).map(([k, n]) => `${k}×${n}`).join(" ")})`);
+  }
+  if (Number.isInteger(out.scenes)) info(`  scenes  ${out.scenes}`);
   info(`  url     ${c.cyan(url)}`);
 }
 
@@ -537,6 +669,7 @@ async function publishBookDir(creds, root, args) {
     };
     const out = await publishApi(creds, "POST", chapterPath, chapterPayload, {
       expectedStatus: 201,
+      awaitAdmission: true,
     });
     const admission = requireReadyAdmission(out, `Chapter "${chapter.title}"`);
     published.push({
@@ -550,8 +683,16 @@ async function publishBookDir(creds, root, args) {
     info(`  ${c.green("+")} ${chapter.source} → ${chapter.title} ${c.dim(`(${admission.gate_version}, ready)`)}`);
   }
 
+  let publication = null;
   if (visibility !== "private") {
-    await publishApi(creds, "PATCH", `/api/books/${bookId}`, { visibility });
+    const publicationResult = await publishApi(
+      creds,
+      "PATCH",
+      `/api/books/${bookId}`,
+      { visibility },
+      { awaitBookPublication: bookId },
+    );
+    publication = publicationResult.publication;
   }
 
   const workspaceUrl = absoluteUrl(creds, `/create/${bookId}`);
@@ -563,6 +704,7 @@ async function publishBookDir(creds, root, args) {
     url: readerUrl,
     workspace_url: workspaceUrl,
     chapters: published,
+    publication,
     published_at: new Date().toISOString(),
   });
   ok(`Book published: ${book.title} (${published.length} chapter(s), ${visibility})`);
@@ -667,8 +809,9 @@ A lesson is one .md file: YAML frontmatter (title/summary/tags/visibility/
 language/emoji) + a luma-md body. A book is a directory: optional luguo.yml
 (same fields + chapters list) + one .md per chapter, sorted by filename.
 Every publish is cleaned, structurally checked, semantically aligned, and
-indexed by the server. Success requires HTTP 201 plus a ready admission receipt;
-stable Idempotency-Key headers make unchanged retries safe from duplicates.
+indexed by the server. HTTP 202 is followed until the durable admission is ready;
+success still requires a complete ready receipt. Stable Idempotency-Key headers
+make unchanged retries safe from duplicates.
 Env: LUGUO_API_KEY, LUGUO_BASE_URL override saved credentials.`);
 }
 
