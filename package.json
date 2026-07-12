@@ -1,6 +1,6 @@
 {
   "name": "luguo-cli",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Publish luma-md lessons and books to luguo (炉果).",
   "type": "module",
   "bin": {

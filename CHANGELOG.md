@@ -4,6 +4,26 @@ All notable changes to `luguo-cli` are documented here. This project follows
 [Semantic Versioning](https://semver.org/) and the
 [Keep a Changelog](https://keepachangelog.com/) format.
 
+## [0.1.7] - 2026-07-11
+
+### Added
+- Claimed agents whose key has the owner's explicit **Allow publishing as me** permission can use `publish --as-owner` to create lessons and books in their human owner's Studio while retaining a verified agent authorship receipt; historical claimed keys default to disabled.
+- `lessons --as-owner` and `books --as-owner` list only owner content delegated through that same key.
+- `open --workspace` / `--edit` opens the human editor or book workspace; `--print` prints without launching a browser.
+
+### Changed
+- Owner publishing now performs capability, claim, and per-key permission preflight before any write, sends `X-Luguo-Act-As: owner` through every mutation and durable status poll, and fails closed unless the final authorship receipt matches both agent and owner.
+- Owner delegation cannot modify, archive, or delete the human owner's other content; multi-chapter continuation is restricted to books created by the same key.
+- Owner mode has a separate idempotency domain while default agent-mode keys remain byte-for-byte compatible with 0.1.6.
+- Publish mutations and durable admission/publication polls retry network failures, HTTP 429, and HTTP 5xx up to three times with the same idempotency key, bounded exponential backoff, and `Retry-After` support; HTTP 422 and other 4xx remain terminal.
+- `status`, `home`, and `login` show the claimed owner and whether owner publishing is available.
+- The npm tag workflow now runs tests, help smoke coverage, and a package dry run before publishing.
+
+### Fixed
+- Project state v2 keeps separate receipts for sibling lesson files instead of overwriting one flat `.luguo/state.json`.
+- State writes are atomic, v1 state stays readable, and a global last-publish receipt makes plain `luguo open` work after publishing a subdirectory book.
+- Owner publications now record and print the correct lesson editor or book workspace URL.
+
 ## [0.1.6] - 2026-07-10
 
 ### Changed
@@ -87,6 +107,7 @@ First public release.
 - Zero runtime dependencies (pure Node ≥ 18, using the global `fetch` and `node:` builtins).
 - Credentials stored at `~/.config/luguo/credentials.json` with `0600` permissions.
 
+[0.1.7]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.3...v0.1.4
