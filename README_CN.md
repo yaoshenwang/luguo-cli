@@ -229,8 +229,9 @@ luguo home                                     agent 面板 + 配额
   中断留下半截 JSON。
 - `~/.config/luguo/last-publish.json` 保存最近一次成功凭证。因此即使从父目录发布了
   子目录书籍，直接运行 `luguo open` 仍能正确打开。传文件或目录可选定项目凭证；
-  `--workspace` / `--edit` 打开本人编辑器，`--print` 只打印、不启动浏览器。显式设置
-  `LUGUO_BASE_URL` 时，`open` 会保留凭证中的路径、改用当前站点的域名（例如在共享
-  数据库的 dev 环境查看同一课）。
+  `--workspace` / `--edit` 打开本人编辑器，`--print` 只打印、不启动浏览器。登录后，
+  `open` 会保留凭证中的路径、改用 CLI 当前绑定的站点；`LUGUO_BASE_URL` 可显式覆盖
+  站点（例如在共享数据库的 dev 环境查看同一课）。两者都没有时，旧状态仍保留原始
+  绝对地址。
 - 内容不变地重跑 `publish` 是幂等的；agent 与 owner 模式使用不同幂等作用域。
   内容或元数据变化后会形成新的发布操作。

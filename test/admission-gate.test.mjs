@@ -937,6 +937,20 @@ test("state v2 preserves sibling lessons, global last works, and legacy state re
     assert.equal(stateFiles.some((name) => name.endsWith(".tmp")), false);
     assert.equal(configFiles.some((name) => name.endsWith(".tmp")), false);
 
+    const credentialsPath = join(home, ".config", "luguo", "credentials.json");
+    await writeFile(credentialsPath, JSON.stringify({
+      api_key: TEST_KEY,
+      base_url: "https://configured.example",
+    }));
+    const configuredSite = await runCli(["open", "--print"], {
+      cwd: root,
+      home,
+      key: "",
+    });
+    assert.equal(configuredSite.code, 0, configuredSite.stderr);
+    assert.equal(configuredSite.stdout.trim(), "https://configured.example/lessons/second");
+    await rm(credentialsPath, { force: true });
+
     const legacyRoot = join(root, "legacy");
     const legacyLesson = join(legacyRoot, "legacy.md");
     await mkdir(join(legacyRoot, ".luguo"), { recursive: true });

@@ -120,7 +120,8 @@ function absoluteUrl(creds, path) {
 }
 
 function openUrlForCurrentBase(creds, target) {
-  if (!process.env.LUGUO_BASE_URL?.trim()) return target;
+  const configuredBase = process.env.LUGUO_BASE_URL?.trim() || creds?.base_url?.trim();
+  if (!configuredBase) return target;
   try {
     const saved = new URL(target);
     return `${baseUrl(creds)}${saved.pathname}${saved.search}${saved.hash}`;
@@ -1152,8 +1153,9 @@ created through this same key; the key cannot edit, archive, or delete the
 owner's other content.
 Publish writes and durable status polls retry transient network/429/5xx failures
 up to three times with the same idempotency key; other 4xx responses fail once.
-Env: LUGUO_API_KEY, LUGUO_BASE_URL override saved credentials. An explicit
-LUGUO_BASE_URL also rebases URLs selected by luguo open to that site.`);
+Env: LUGUO_API_KEY, LUGUO_BASE_URL override saved credentials. URLs selected by
+luguo open follow the configured site (or explicit LUGUO_BASE_URL) while keeping
+their saved path.`);
 }
 
 const args = parseArgs(process.argv.slice(2));
