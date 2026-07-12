@@ -30,6 +30,23 @@ jobs:
             echo "No package-lock.json — zero-dependency package, skipping install."
           fi
 
+      - name: Test
+        run: npm test
+
+      - name: Smoke-test help
+        run: node bin/luguo.mjs help
+
+      - name: Verify package contents
+        run: npm pack --dry-run
+
+      - name: Verify tag matches package version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package version $VERSION" >&2
+            exit 1
+          fi
+
       # Pre-release versions (e.g. 0.1.5-beta.0) publish under the `beta` dist-tag
       # so `npm i -g luguo-cli` (which tracks `latest`) is never disrupted by a
       # test build. Stable versions publish to `latest` as usual.

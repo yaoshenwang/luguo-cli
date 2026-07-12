@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +26,24 @@ const READY_ADMISSION = {
     bindings: 3,
     prereqEdges: 1,
   },
+};
+
+const OWNER_HOME = {
+  agent: {
+    id: "agent_user_test_1",
+    handle: "mock-agent",
+    claimed: true,
+    owner: { id: "owner_user_test_1", handle: "mock-owner", full_name: "Mock Owner" },
+  },
+  capabilities: { publish_as_owner: true },
+  quota: { daily_create_remaining: 199, daily_create_limit: 200, trial: false },
+  my_lessons: [],
+};
+
+const OWNER_AUTHORSHIP = {
+  mode: "owner",
+  agent: { id: "agent_user_test_1", handle: "mock-agent" },
+  owner: { id: "owner_user_test_1", handle: "mock-owner" },
 };
 
 const LESSON = `---
@@ -71,16 +90,38 @@ function stripAnsi(value) {
   return value.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item === undefined ? null : item)).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .filter((key) => value[key] !== undefined)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function legacyIdempotencyKey(baseUrl, method, path, body, key = TEST_KEY) {
+  const identityScope = createHash("sha256").update(`${baseUrl}\n${key}`).digest("hex");
+  const digest = createHash("sha256")
+    .update(`${identityScope}\n${method.toUpperCase()}\n${path}\n${canonicalJson(body)}`)
+    .digest("hex");
+  return `luguo-cli-v1-${digest}`;
+}
+
 function runCli(args, { cwd, home, baseUrl, key = TEST_KEY } = {}) {
   return new Promise((resolveRun) => {
+    const env = {
+      ...process.env,
+      HOME: home,
+      LUGUO_API_KEY: key,
+    };
+    if (baseUrl === undefined) delete env.LUGUO_BASE_URL;
+    else env.LUGUO_BASE_URL = baseUrl;
     execFile(process.execPath, [CLI, ...args], {
       cwd: cwd || REPO_ROOT,
-      env: {
-        ...process.env,
-        HOME: home,
-        LUGUO_BASE_URL: baseUrl,
-        LUGUO_API_KEY: key,
-      },
+      env,
       maxBuffer: 1024 * 1024,
     }, (error, stdout, stderr) => {
       resolveRun({
@@ -133,6 +174,11 @@ test("help documents automatic admission", async () => {
     assert.equal(out.code, 0);
     assert.match(out.stdout, /automatic admission gate/i);
     assert.match(out.stdout, /idempotency/i);
+    assert.match(out.stdout, /publish <file\.md \| dir>[\s\S]*--as-owner/);
+    assert.match(out.stdout, /claimed agent[\s\S]*authorship[\s\S]*receipt/i);
+    assert.match(out.stdout, /Allow publishing as me[\s\S]*same key[\s\S]*cannot edit/i);
+    assert.match(out.stdout, /open \[path\] \[--workspace\|--edit\] \[--print\]/);
+    assert.match(out.stdout, /retry transient network\/429\/5xx failures[\s\S]*three times/i);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -178,6 +224,171 @@ test("doctor can check a mock server without reading real credentials", async ()
   }
 });
 
+test("status and home show the claimed owner and owner-publish capability", async () => {
+  const { root, home } = await tempProject();
+  try {
+    await withMock((req, res) => {
+      assert.equal(req.method, "GET");
+      if (req.url === "/skill.md") {
+        res.writeHead(200, { "content-type": "text/markdown" });
+        res.end("# Mock skill\n");
+        return;
+      }
+      assert.equal(req.url, "/api/v1/agent/home");
+      assert.equal(req.headers["x-luguo-act-as"], undefined);
+      sendJson(res, 200, OWNER_HOME);
+    }, async (baseUrl) => {
+      const status = await runCli(["status"], { cwd: root, home, baseUrl });
+      const dashboard = await runCli(["home"], { cwd: root, home, baseUrl });
+      const doctor = await runCli(["doctor"], { cwd: root, home, baseUrl });
+      assert.equal(status.code, 0, status.stderr);
+      assert.equal(dashboard.code, 0, dashboard.stderr);
+      assert.equal(doctor.code, 0, doctor.stderr);
+      assert.match(status.stdout, /@mock-agent \(claimed\)/);
+      assert.match(status.stdout, /Owner: @mock-owner/);
+      assert.match(status.stdout, /available with --as-owner/);
+      assert.match(dashboard.stdout, /Owner: @mock-owner/);
+      assert.match(dashboard.stdout, /199 create\(s\) left/);
+      assert.match(doctor.stdout, /Owner: @mock-owner/);
+      assert.match(doctor.stdout, /available with --as-owner/);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("status tells a claimed owner to enable per-key publishing when capability is false", async () => {
+  const { root, home } = await tempProject();
+  try {
+    await withMock((req, res) => {
+      sendJson(res, 200, { ...OWNER_HOME, capabilities: { publish_as_owner: false } });
+    }, async (baseUrl) => {
+      const out = await runCli(["status"], { cwd: root, home, baseUrl });
+      assert.equal(out.code, 0, out.stderr);
+      assert.match(out.stdout, /disabled for this key/);
+      assert.match(out.stdout, /Allow publishing as me.*Settings/);
+      assert.doesNotMatch(out.stdout, /server version/);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("--as-owner preflight distinguishes unclaimed, disabled keys, and unsupported servers", async () => {
+  const { root, home } = await tempProject();
+  const lessonPath = join(root, "lesson.md");
+  await writeFile(lessonPath, LESSON);
+  try {
+    for (const scenario of [
+      {
+        home: { agent: { id: "agent_user_test_1", handle: "mock-agent", claimed: false, owner: null } },
+        error: /requires a claimed agent/,
+      },
+      {
+        home: { ...OWNER_HOME, capabilities: { publish_as_owner: false } },
+        error: /disabled for this key.*Allow publishing as me.*No content was written/,
+      },
+      {
+        home: { ...OWNER_HOME, capabilities: undefined },
+        error: /not supported by this server version.*No content was written/,
+      },
+    ]) {
+      let writes = 0;
+      await withMock((req, res) => {
+        if (req.method !== "GET") writes += 1;
+        sendJson(res, 200, scenario.home);
+      }, async (baseUrl) => {
+        const out = await runCli(["publish", lessonPath, "--as-owner"], { cwd: root, home, baseUrl });
+        assert.equal(out.code, 1);
+        assert.match(out.stderr, scenario.error);
+      });
+      assert.equal(writes, 0);
+    }
+    await assert.rejects(readFile(join(root, ".luguo", "state.json"), "utf8"), /ENOENT/);
+    await assert.rejects(readFile(join(home, ".config", "luguo", "last-publish.json"), "utf8"), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lessons and books --as-owner preflight then query the owner scope", async () => {
+  const { root, home } = await tempProject();
+  try {
+    let ownerHomeReads = 0;
+    let ownerBookReads = 0;
+    await withMock((req, res) => {
+      if (req.method === "GET" && req.url === "/api/v1/agent/home") {
+        if (req.headers["x-luguo-act-as"] === "owner") {
+          ownerHomeReads += 1;
+          sendJson(res, 200, {
+            ...OWNER_HOME,
+            my_lessons: [{ id: "lesson_owner_1", title: "Owner lesson", slug: "owner-lesson", visibility: "private" }],
+            authorship: OWNER_AUTHORSHIP,
+          });
+        } else {
+          sendJson(res, 200, OWNER_HOME);
+        }
+        return;
+      }
+      if (req.method === "GET" && req.url === "/api/books") {
+        assert.equal(req.headers["x-luguo-act-as"], "owner");
+        ownerBookReads += 1;
+        sendJson(res, 200, {
+          books: [{ id: "book_owner_1", title: "Owner book", visibility: "private" }],
+          authorship: OWNER_AUTHORSHIP,
+        });
+        return;
+      }
+      sendJson(res, 404, { error: "Not found" });
+    }, async (baseUrl) => {
+      const lessons = await runCli(["lessons", "--as-owner"], { cwd: root, home, baseUrl });
+      const books = await runCli(["books", "--as-owner"], { cwd: root, home, baseUrl });
+      assert.equal(lessons.code, 0, lessons.stderr);
+      assert.equal(books.code, 0, books.stderr);
+      assert.match(lessons.stdout, /Owner scope: @mock-owner/);
+      assert.match(lessons.stdout, /Owner lesson/);
+      assert.match(books.stdout, /Owner scope: @mock-owner/);
+      assert.match(books.stdout, /Owner book/);
+    });
+    assert.equal(ownerHomeReads, 1);
+    assert.equal(ownerBookReads, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("owner-scoped lesson and book lists fail closed without matching authorship", async () => {
+  const { root, home } = await tempProject();
+  try {
+    for (const command of ["lessons", "books"]) {
+      await withMock((req, res) => {
+        if (req.method === "GET" && req.url === "/api/v1/agent/home" && req.headers["x-luguo-act-as"] !== "owner") {
+          sendJson(res, 200, OWNER_HOME);
+          return;
+        }
+        assert.equal(req.headers["x-luguo-act-as"], "owner");
+        if (command === "lessons") {
+          sendJson(res, 200, { ...OWNER_HOME, my_lessons: [] });
+        } else {
+          sendJson(res, 200, {
+            books: [],
+            authorship: { ...OWNER_AUTHORSHIP, owner: { id: "wrong_owner", handle: "wrong-owner" } },
+          });
+        }
+      }, async (baseUrl) => {
+        const out = await runCli([command, "--as-owner"], { cwd: root, home, baseUrl });
+        assert.equal(out.code, 1);
+        assert.match(
+          out.stderr,
+          command === "lessons" ? /did not return an authorship receipt/ : /does not match the claimed owner/,
+        );
+      });
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("validate sends luma-md to the server", async () => {
   const { root, home } = await tempProject();
   const lessonPath = join(root, "lesson.md");
@@ -202,6 +413,27 @@ test("validate sends luma-md to the server", async () => {
       assert.equal(out.code, 0);
       assert.match(out.stdout, /OK: Mock admission lesson: 2 block\(s\), 1 scene\(s\)/);
     });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("ordinary validation does not use publish-only transient retries", async () => {
+  const { root, home } = await tempProject();
+  const lessonPath = join(root, "lesson.md");
+  await writeFile(lessonPath, LESSON);
+  let requests = 0;
+  try {
+    await withMock((req, res) => {
+      requests += 1;
+      sendJson(res, 500, { error: "validation unavailable" }, { "retry-after": "0" });
+    }, async (baseUrl) => {
+      const out = await runCli(["validate", lessonPath], { cwd: root, home, baseUrl });
+      assert.equal(out.code, 1);
+      assert.match(out.stderr, /HTTP 500: validation unavailable/);
+      assert.doesNotMatch(out.stdout, /retry 1\/3/);
+    });
+    assert.equal(requests, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -250,8 +482,199 @@ test("lesson publish requires 201 ready, persists admission, and reuses a stable
     assert.notEqual(keys[0], keys[2]);
     assert.notEqual(keys[0], keys[3]);
     const state = JSON.parse(await readFile(join(root, ".luguo", "state.json"), "utf8"));
-    assert.deepEqual(state.admission, READY_ADMISSION);
-    assert.equal(state.lesson_id, "lesson_test_1");
+    assert.equal(state.version, 2);
+    assert.deepEqual(state.lessons["lesson.md"].admission, READY_ADMISSION);
+    assert.equal(state.lessons["lesson.md"].lesson_id, "lesson_test_1");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lesson publish retries an initial HTTP 500 with the same idempotency key", async () => {
+  const { root, home } = await tempProject();
+  const lessonPath = join(root, "lesson.md");
+  await writeFile(lessonPath, LESSON);
+  const keys = [];
+  try {
+    await withMock((req, res) => {
+      assert.equal(req.method, "POST");
+      keys.push(req.headers["idempotency-key"]);
+      if (keys.length === 1) {
+        sendJson(res, 500, { error: "temporary server fault" }, { "retry-after": "0" });
+        return;
+      }
+      sendJson(res, 201, {
+        lesson: { id: "lesson_after_500", slug: "after-500", url: "/lessons/after-500" },
+        admission: READY_ADMISSION,
+      });
+    }, async (baseUrl) => {
+      const out = await runCli(["publish", lessonPath], { cwd: root, home, baseUrl });
+      assert.equal(out.code, 0, out.stderr);
+      assert.match(out.stdout, /Transient HTTP 500 .*retry 1\/3 in 0ms/);
+      assert.doesNotMatch(out.stdout, new RegExp(TEST_KEY));
+    });
+    assert.equal(keys.length, 2);
+    assert.equal(keys[0], keys[1]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lesson publish retries an initial network failure with the same idempotency key", async () => {
+  const { root, home } = await tempProject();
+  const lessonPath = join(root, "lesson.md");
+  await writeFile(lessonPath, LESSON);
+  const keys = [];
+  try {
+    await withMock((req, res) => {
+      assert.equal(req.method, "POST");
+      keys.push(req.headers["idempotency-key"]);
+      if (keys.length === 1) {
+        req.socket.destroy();
+        return;
+      }
+      sendJson(res, 201, {
+        lesson: { id: "lesson_after_network", slug: "after-network", url: "/lessons/after-network" },
+        admission: READY_ADMISSION,
+      });
+    }, async (baseUrl) => {
+      const out = await runCli(["publish", lessonPath], { cwd: root, home, baseUrl });
+      assert.equal(out.code, 0, out.stderr);
+      assert.match(out.stdout, /Transient network error .*retry 1\/3 in 500ms/);
+      assert.doesNotMatch(out.stdout, new RegExp(TEST_KEY));
+    });
+    assert.equal(keys.length, 2);
+    assert.equal(keys[0], keys[1]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("transient publish retries are bounded to three and keep one idempotency key", async () => {
+  const { root, home } = await tempProject();
+  const lessonPath = join(root, "lesson.md");
+  await writeFile(lessonPath, LESSON);
+  const keys = [];
+  try {
+    await withMock((req, res) => {
+      keys.push(req.headers["idempotency-key"]);
+      sendJson(res, 503, { error: "still unavailable" }, { "retry-after": "0" });
+    }, async (baseUrl) => {
+      const out = await runCli(["publish", lessonPath], { cwd: root, home, baseUrl });
+      assert.equal(out.code, 1);
+      assert.match(out.stdout, /retry 3\/3 in 0ms/);
+      assert.match(out.stderr, /HTTP 503: still unavailable/);
+    });
+    assert.equal(keys.length, 4);
+    assert.equal(new Set(keys).size, 1);
+    await assert.rejects(readFile(join(root, ".luguo", "state.json"), "utf8"), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("claimed owner publish is scoped, idempotent, verified, and opens the human workspace", async () => {
+  const { root, home } = await tempProject();
+  const lessonPath = join(root, "lesson.md");
+  await writeFile(lessonPath, LESSON);
+  const requests = [];
+  try {
+    await withMock(async (req, res) => {
+      if (req.method === "GET" && req.url === "/api/v1/agent/home") {
+        assert.equal(req.headers["x-luguo-act-as"], undefined);
+        sendJson(res, 200, OWNER_HOME);
+        return;
+      }
+      if (req.method === "POST" && req.url === "/api/agent/lessons") {
+        const mode = req.headers["x-luguo-act-as"] === "owner" ? "owner" : "agent";
+        const body = await readJsonBody(req);
+        requests.push({ mode, body, key: req.headers["idempotency-key"] });
+        const id = mode === "owner" ? "lesson_owner_1" : "lesson_agent_1";
+        sendJson(res, 201, {
+          lesson: { id, slug: `${mode}-lesson`, url: `/lessons/${mode}-lesson` },
+          admission: READY_ADMISSION,
+          ...(mode === "owner" ? { authorship: OWNER_AUTHORSHIP } : {}),
+        });
+        return;
+      }
+      sendJson(res, 404, { error: "Not found" });
+    }, async (baseUrl) => {
+      const first = await runCli(["publish", lessonPath, "--as-owner"], { cwd: root, home, baseUrl });
+      const second = await runCli(["publish", "--as-owner", lessonPath], { cwd: root, home, baseUrl });
+      assert.equal(first.code, 0, first.stderr);
+      assert.equal(second.code, 0, second.stderr);
+      assert.match(first.stdout, /author\s+@mock-owner \(via @mock-agent\)/);
+      assert.match(first.stdout, new RegExp(`${baseUrl}/lessons/lesson_owner_1/edit`));
+
+      const stateAfterOwner = JSON.parse(await readFile(join(root, ".luguo", "state.json"), "utf8"));
+      const ownerReceipt = stateAfterOwner.lessons["lesson.md"];
+      assert.equal(ownerReceipt.publish_as, "owner");
+      assert.deepEqual(ownerReceipt.authorship, OWNER_AUTHORSHIP);
+      assert.equal(ownerReceipt.workspace_url, `${baseUrl}/lessons/lesson_owner_1/edit`);
+      const global = JSON.parse(await readFile(join(home, ".config", "luguo", "last-publish.json"), "utf8"));
+      assert.equal(global.receipt.workspace_url, ownerReceipt.workspace_url);
+
+      const opened = await runCli(["open", "--workspace", lessonPath, "--print"], { cwd: root, home, baseUrl, key: "" });
+      assert.equal(opened.code, 0, opened.stderr);
+      assert.equal(opened.stdout.trim(), ownerReceipt.workspace_url);
+
+      const rebased = await runCli(["open", "--workspace", lessonPath, "--print"], {
+        cwd: root,
+        home,
+        baseUrl: "https://dev.example",
+        key: "",
+      });
+      assert.equal(rebased.code, 0, rebased.stderr);
+      assert.equal(rebased.stdout.trim(), "https://dev.example/lessons/lesson_owner_1/edit");
+
+      const agent = await runCli(["publish", lessonPath], { cwd: root, home, baseUrl });
+      assert.equal(agent.code, 0, agent.stderr);
+
+      assert.equal(requests.length, 3);
+      assert.equal(requests[0].mode, "owner");
+      assert.equal(requests[1].mode, "owner");
+      assert.equal(requests[2].mode, "agent");
+      assert.equal(requests[0].key, requests[1].key);
+      assert.notEqual(requests[0].key, requests[2].key);
+      assert.equal(
+        requests[2].key,
+        legacyIdempotencyKey(baseUrl, "POST", "/api/agent/lessons", requests[2].body),
+      );
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("owner publish fails closed on missing or mismatched authorship and writes no state", async () => {
+  const { root, home } = await tempProject();
+  const lessonPath = join(root, "lesson.md");
+  await writeFile(lessonPath, LESSON);
+  let publishNumber = 0;
+  try {
+    await withMock((req, res) => {
+      if (req.method === "GET") {
+        sendJson(res, 200, OWNER_HOME);
+        return;
+      }
+      publishNumber += 1;
+      sendJson(res, 201, {
+        lesson: { id: `lesson_wrong_${publishNumber}`, slug: `wrong-${publishNumber}`, url: `/lessons/wrong-${publishNumber}` },
+        admission: READY_ADMISSION,
+        ...(publishNumber === 2
+          ? { authorship: { ...OWNER_AUTHORSHIP, owner: { id: "someone_else", handle: "wrong-owner" } } }
+          : {}),
+      });
+    }, async (baseUrl) => {
+      const missing = await runCli(["publish", lessonPath, "--as-owner"], { cwd: root, home, baseUrl });
+      const mismatch = await runCli(["publish", lessonPath, "--as-owner"], { cwd: root, home, baseUrl });
+      assert.equal(missing.code, 1);
+      assert.match(missing.stderr, /did not return an authorship receipt/);
+      assert.equal(mismatch.code, 1);
+      assert.match(mismatch.stderr, /does not match the claimed owner/);
+    });
+    await assert.rejects(readFile(join(root, ".luguo", "state.json"), "utf8"), /ENOENT/);
+    await assert.rejects(readFile(join(home, ".config", "luguo", "last-publish.json"), "utf8"), /ENOENT/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -307,8 +730,59 @@ test("lesson publish follows a durable 202 admission until it is ready", async (
     assert.equal(posts, 1);
     assert.equal(polls, 2);
     const state = JSON.parse(await readFile(join(root, ".luguo", "state.json"), "utf8"));
-    assert.equal(state.admission.id, "11111111-1111-4111-8111-111111111111");
-    assert.equal(state.admission.status, "ready");
+    assert.equal(state.lessons["lesson.md"].admission.id, "11111111-1111-4111-8111-111111111111");
+    assert.equal(state.lessons["lesson.md"].admission.status, "ready");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("owner-mode 202 admission polling preserves act-as-owner and verifies final authorship", async () => {
+  const { root, home } = await tempProject();
+  const lessonPath = join(root, "lesson.md");
+  await writeFile(lessonPath, LESSON);
+  const admissionId = "33333333-3333-4333-8333-333333333333";
+  let polls = 0;
+  try {
+    await withMock((req, res) => {
+      if (req.method === "GET" && req.url === "/api/v1/agent/home") {
+        assert.equal(req.headers["x-luguo-act-as"], undefined);
+        sendJson(res, 200, OWNER_HOME);
+        return;
+      }
+      if (req.method === "POST" && req.url === "/api/agent/lessons") {
+        assert.equal(req.headers["x-luguo-act-as"], "owner");
+        const statusUrl = `/api/agent/admissions/${admissionId}`;
+        sendJson(res, 202, {
+          queued: true,
+          admission: { id: admissionId, status: "validating" },
+          status_url: statusUrl,
+        }, { location: statusUrl, "retry-after": "0" });
+        return;
+      }
+      if (req.method === "GET" && req.url === `/api/agent/admissions/${admissionId}`) {
+        assert.equal(req.headers["x-luguo-act-as"], "owner");
+        polls += 1;
+        if (polls === 1) {
+          sendJson(res, 500, { error: "temporary poll failure" }, { "retry-after": "0" });
+          return;
+        }
+        sendJson(res, 200, {
+          lesson: { id: "lesson_owner_queued", slug: "owner-queued", url: "/lessons/owner-queued" },
+          admission: { ...READY_ADMISSION, id: admissionId },
+          authorship: OWNER_AUTHORSHIP,
+        });
+        return;
+      }
+      sendJson(res, 404, { error: "Not found" });
+    }, async (baseUrl) => {
+      const out = await runCli(["publish", lessonPath, "--as-owner"], { cwd: root, home, baseUrl });
+      assert.equal(out.code, 0, out.stderr);
+      assert.match(out.stdout, /Transient HTTP 500 from GET .*retry 1\/3 in 0ms/);
+    });
+    assert.equal(polls, 2);
+    const state = JSON.parse(await readFile(join(root, ".luguo", "state.json"), "utf8"));
+    assert.deepEqual(state.lessons["lesson.md"].authorship, OWNER_AUTHORSHIP);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -318,8 +792,10 @@ test("422 admission issues are printed with paths and codes", async () => {
   const { root, home } = await tempProject();
   const lessonPath = join(root, "lesson.md");
   await writeFile(lessonPath, LESSON);
+  let requests = 0;
   try {
     await withMock((req, res) => {
+      requests += 1;
       sendJson(res, 422, {
         error: "Content admission failed",
         issues: [{
@@ -335,6 +811,7 @@ test("422 admission issues are printed with paths and codes", async () => {
       assert.match(out.stderr, /HTTP 422: Content admission failed/);
       assert.match(out.stderr, /body\.quiz\.q-mock-1\.skills \[quiz_missing_skill\]: Add at least one canonical skill\./);
     });
+    assert.equal(requests, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -399,6 +876,102 @@ test("publish rejects non-201 and non-ready admission responses", async () => {
   }
 });
 
+test("state v2 preserves sibling lessons, global last works, and legacy state remains readable", async () => {
+  const { root, home } = await tempProject();
+  const firstPath = join(root, "first.md");
+  const secondPath = join(root, "second.md");
+  await writeFile(firstPath, LESSON);
+  await writeFile(secondPath, LESSON.replaceAll("Mock admission lesson", "Second lesson"));
+  try {
+    await withMock(async (req, res) => {
+      assert.equal(req.method, "POST");
+      assert.equal(req.url, "/api/agent/lessons");
+      const body = await readJsonBody(req);
+      const second = body.title === "Second lesson";
+      sendJson(res, 201, {
+        lesson: {
+          id: second ? "lesson_second" : "lesson_first",
+          slug: second ? "second" : "first",
+          url: second ? "/lessons/second" : "/lessons/first",
+        },
+        admission: READY_ADMISSION,
+      });
+    }, async (baseUrl) => {
+      const first = await runCli(["publish", firstPath], { cwd: root, home, baseUrl });
+      const second = await runCli(["publish", secondPath], { cwd: root, home, baseUrl });
+      assert.equal(first.code, 0, first.stderr);
+      assert.equal(second.code, 0, second.stderr);
+
+      const state = JSON.parse(await readFile(join(root, ".luguo", "state.json"), "utf8"));
+      assert.equal(state.version, 2);
+      assert.equal(state.lessons["first.md"].lesson_id, "lesson_first");
+      assert.equal(state.lessons["second.md"].lesson_id, "lesson_second");
+      assert.deepEqual(state.last, { kind: "lesson", key: "second.md" });
+
+      const explicit = await runCli(["open", firstPath, "--print"], { cwd: root, home, baseUrl, key: "" });
+      const printBeforePath = await runCli(["open", "--print", firstPath], { cwd: root, home, baseUrl, key: "" });
+      const latest = await runCli(["open", "--print"], { cwd: root, home, baseUrl, key: "" });
+      const noWorkspace = await runCli(["open", firstPath, "--workspace", "--print"], { cwd: root, home, baseUrl, key: "" });
+      assert.equal(explicit.stdout.trim(), `${baseUrl}/lessons/first`);
+      assert.equal(printBeforePath.stdout.trim(), `${baseUrl}/lessons/first`);
+      assert.equal(latest.stdout.trim(), `${baseUrl}/lessons/second`);
+      assert.equal(noWorkspace.code, 1);
+      assert.match(noWorkspace.stderr, /has no human workspace URL/);
+
+      const rebasedLatest = await runCli(["open", "--print"], {
+        cwd: root,
+        home,
+        baseUrl: "https://dev.example",
+        key: "",
+      });
+      assert.equal(rebasedLatest.code, 0, rebasedLatest.stderr);
+      assert.equal(rebasedLatest.stdout.trim(), "https://dev.example/lessons/second");
+
+      const badFlag = await runCli(["publish", firstPath, "--as-owner=true"], { cwd: root, home, baseUrl });
+      assert.equal(badFlag.code, 1);
+      assert.match(badFlag.stderr, /--as-owner does not take a value/);
+    });
+
+    const stateFiles = await readdir(join(root, ".luguo"));
+    const configFiles = await readdir(join(home, ".config", "luguo"));
+    assert.equal(stateFiles.some((name) => name.endsWith(".tmp")), false);
+    assert.equal(configFiles.some((name) => name.endsWith(".tmp")), false);
+
+    const legacyRoot = join(root, "legacy");
+    const legacyLesson = join(legacyRoot, "legacy.md");
+    await mkdir(join(legacyRoot, ".luguo"), { recursive: true });
+    await writeFile(legacyLesson, LESSON);
+    await writeFile(join(legacyRoot, ".luguo", "state.json"), JSON.stringify({
+      lesson_id: "legacy_lesson",
+      url: "https://legacy.example/lessons/legacy",
+    }));
+    const legacy = await runCli(["open", legacyLesson, "--print"], {
+      cwd: legacyRoot,
+      home,
+      key: "",
+    });
+    assert.equal(legacy.code, 0, legacy.stderr);
+    assert.equal(legacy.stdout.trim(), "https://legacy.example/lessons/legacy");
+
+    await withMock((req, res) => {
+      assert.equal(req.method, "POST");
+      sendJson(res, 201, {
+        lesson: { id: "legacy_republished", slug: "legacy-republished", url: "/lessons/legacy-republished" },
+        admission: READY_ADMISSION,
+      });
+    }, async (baseUrl) => {
+      const republished = await runCli(["publish", legacyLesson], { cwd: legacyRoot, home, baseUrl });
+      assert.equal(republished.code, 0, republished.stderr);
+    });
+    const migrated = JSON.parse(await readFile(join(legacyRoot, ".luguo", "state.json"), "utf8"));
+    assert.equal(migrated.version, 2);
+    assert.equal(migrated.lessons.__legacy__.lesson_id, "legacy_lesson");
+    assert.equal(migrated.lessons["legacy.md"].lesson_id, "legacy_republished");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("book chapters pass the same gate and retain per-chapter admission receipts", async () => {
   const { root, home } = await tempProject();
   const bookRoot = join(root, "book");
@@ -447,8 +1020,8 @@ test("book chapters pass the same gate and retain per-chapter admission receipts
       assert.match(keys[0], /^luguo-cli-v1-[a-f0-9]{64}$/);
     }
     const state = JSON.parse(await readFile(join(bookRoot, ".luguo", "state.json"), "utf8"));
-    assert.deepEqual(state.chapters[0].admission, READY_ADMISSION);
-    assert.equal(state.publication.status, "committed");
+    assert.deepEqual(state.book.chapters[0].admission, READY_ADMISSION);
+    assert.equal(state.book.publication.status, "committed");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -508,10 +1081,151 @@ test("book publish follows a 202 publication saga through atomic commit", async 
     });
     assert.equal(polls, 2);
     const state = JSON.parse(await readFile(join(bookRoot, ".luguo", "state.json"), "utf8"));
-    assert.deepEqual(state.publication, {
+    assert.deepEqual(state.book.publication, {
       id: "11111111-1111-4111-8111-111111111111",
       status: "committed",
     });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("owner book publish carries owner scope through every mutation and publication poll", async () => {
+  const { root, home } = await tempProject();
+  const bookRoot = join(root, "owner-book");
+  await mkdir(bookRoot);
+  await writeFile(join(bookRoot, "luguo.yml"), "title: Owner book\nvisibility: unlisted\nlanguage: en\n");
+  await writeFile(join(bookRoot, "01-chapter.md"), LESSON);
+  const runId = "44444444-4444-4444-8444-444444444444";
+  const ownerRequests = [];
+  let publicationPolls = 0;
+  try {
+    await withMock((req, res) => {
+      if (req.method === "GET" && req.url === "/api/v1/agent/home") {
+        assert.equal(req.headers["x-luguo-act-as"], undefined);
+        sendJson(res, 200, OWNER_HOME);
+        return;
+      }
+      assert.equal(req.headers["x-luguo-act-as"], "owner");
+      ownerRequests.push(`${req.method} ${req.url}`);
+      if (req.method === "POST" && req.url === "/api/books") {
+        sendJson(res, 200, {
+          book: { id: "book_owner_1", slug: "owner-book" },
+          authorship: OWNER_AUTHORSHIP,
+        });
+        return;
+      }
+      if (req.method === "POST" && req.url === "/api/books/book_owner_1/chapters") {
+        sendJson(res, 201, {
+          chapter: { id: "chapter_owner_1", lesson_id: "lesson_owner_chapter_1" },
+          lesson: { id: "lesson_owner_chapter_1", slug: "owner-chapter" },
+          course: { id: "course_owner_1", slug: "owner-course" },
+          admission: READY_ADMISSION,
+          authorship: OWNER_AUTHORSHIP,
+        });
+        return;
+      }
+      if (req.method === "PATCH" && req.url === "/api/books/book_owner_1") {
+        const statusUrl = `/api/books/book_owner_1/publications/${runId}`;
+        sendJson(res, 202, {
+          queued: true,
+          publication: { id: runId, status: "validating" },
+          status_url: statusUrl,
+        }, { location: statusUrl, "retry-after": "0" });
+        return;
+      }
+      if (req.method === "GET" && req.url === `/api/books/book_owner_1/publications/${runId}`) {
+        publicationPolls += 1;
+        if (publicationPolls === 1) {
+          sendJson(res, 429, { error: "temporarily rate limited" }, { "retry-after": "0" });
+          return;
+        }
+        sendJson(res, 200, {
+          publication: { id: runId, status: "committed" },
+          book: { id: "book_owner_1", slug: "owner-book", visibility: "unlisted" },
+          authorship: OWNER_AUTHORSHIP,
+        });
+        return;
+      }
+      sendJson(res, 404, { error: "Not found" });
+    }, async (baseUrl) => {
+      const out = await runCli(["publish", "--as-owner", bookRoot], { cwd: root, home, baseUrl });
+      assert.equal(out.code, 0, out.stderr);
+      assert.match(out.stdout, /author\s+@mock-owner \(via @mock-agent\)/);
+      assert.match(out.stdout, /Transient HTTP 429 from GET .*retry 1\/3 in 0ms/);
+      assert.match(out.stdout, new RegExp(`${baseUrl}/create/book_owner_1`));
+
+      const state = JSON.parse(await readFile(join(bookRoot, ".luguo", "state.json"), "utf8"));
+      assert.equal(state.book.publish_as, "owner");
+      assert.deepEqual(state.book.authorship, OWNER_AUTHORSHIP);
+      assert.deepEqual(state.book.chapters[0].authorship, OWNER_AUTHORSHIP);
+      assert.equal(state.book.workspace_url, `${baseUrl}/create/book_owner_1`);
+
+      const opened = await runCli(["open", "--workspace", "--print"], { cwd: root, home, baseUrl, key: "" });
+      assert.equal(opened.code, 0, opened.stderr);
+      assert.equal(opened.stdout.trim(), `${baseUrl}/create/book_owner_1`);
+    });
+    assert.deepEqual(ownerRequests, [
+      "POST /api/books",
+      "POST /api/books/book_owner_1/chapters",
+      "PATCH /api/books/book_owner_1",
+      `GET /api/books/book_owner_1/publications/${runId}`,
+      `GET /api/books/book_owner_1/publications/${runId}`,
+    ]);
+    assert.equal(publicationPolls, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("owner book publish fails closed at create, chapter, and final publication authorship", async () => {
+  const { root, home } = await tempProject();
+  try {
+    for (const stage of ["book", "chapter", "publication"]) {
+      const bookRoot = join(root, `book-${stage}`);
+      await mkdir(bookRoot);
+      await writeFile(join(bookRoot, "luguo.yml"), `title: ${stage} receipt\nvisibility: unlisted\nlanguage: en\n`);
+      await writeFile(join(bookRoot, "01-chapter.md"), LESSON);
+      await withMock((req, res) => {
+        if (req.method === "GET" && req.url === "/api/v1/agent/home") {
+          sendJson(res, 200, OWNER_HOME);
+          return;
+        }
+        assert.equal(req.headers["x-luguo-act-as"], "owner");
+        if (req.method === "POST" && req.url === "/api/books") {
+          sendJson(res, 200, {
+            book: { id: `book_${stage}`, slug: `book-${stage}` },
+            ...(stage === "book" ? {} : { authorship: OWNER_AUTHORSHIP }),
+          });
+          return;
+        }
+        if (req.method === "POST" && req.url === `/api/books/book_${stage}/chapters`) {
+          sendJson(res, 201, {
+            chapter: { id: `chapter_${stage}`, lesson_id: `lesson_${stage}` },
+            lesson: { id: `lesson_${stage}`, slug: `lesson-${stage}` },
+            course: { id: `course_${stage}`, slug: `course-${stage}` },
+            admission: READY_ADMISSION,
+            ...(stage === "chapter" ? {} : { authorship: OWNER_AUTHORSHIP }),
+          });
+          return;
+        }
+        if (req.method === "PATCH" && req.url === `/api/books/book_${stage}`) {
+          sendJson(res, 200, {
+            publication: { id: `publication_${stage}`, status: "committed" },
+            book: { id: `book_${stage}`, visibility: "unlisted" },
+            ...(stage === "publication" ? {} : { authorship: OWNER_AUTHORSHIP }),
+          });
+          return;
+        }
+        sendJson(res, 404, { error: "Not found" });
+      }, async (baseUrl) => {
+        const out = await runCli(["publish", bookRoot, "--as-owner"], { cwd: root, home, baseUrl });
+        assert.equal(out.code, 1);
+        assert.match(out.stderr, /did not return an authorship receipt/);
+      });
+      await assert.rejects(readFile(join(bookRoot, ".luguo", "state.json"), "utf8"), /ENOENT/);
+    }
+    await assert.rejects(readFile(join(home, ".config", "luguo", "last-publish.json"), "utf8"), /ENOENT/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -11,17 +11,26 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 
 const CRED_PATH = join(homedir(), ".config", "luguo", "credentials.json");
+const LAST_PUBLISH_PATH = join(homedir(), ".config", "luguo", "last-publish.json");
 const DEFAULT_BASE = "https://luguo.ai";
 const STATE_DIR = ".luguo";
 const STATE_FILE = "state.json";
+const STATE_VERSION = 2;
 const VISIBILITIES = ["private", "public", "unlisted"];
+const AUTHOR_MODES = { agent: "agent", owner: "owner" };
+const BOOLEAN_FLAGS = new Set(["as-owner", "workspace", "edit", "print", "save"]);
+const TRANSIENT_MAX_RETRIES = 3;
+const TRANSIENT_RETRY_BASE_MS = 500;
+const TRANSIENT_RETRY_MAX_MS = 30_000;
 // Named sites the CLI can bind to. `login` persists the chosen base into the
 // credentials file, so every later command targets that same site.
 const ENVS = {
@@ -52,7 +61,21 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg.startsWith("--")) {
-      const key = arg.slice(2);
+      const raw = arg.slice(2);
+      const equals = raw.indexOf("=");
+      const key = equals === -1 ? raw : raw.slice(0, equals);
+      if (BOOLEAN_FLAGS.has(key)) {
+        // Boolean flags never consume the following positional argument, so
+        // both `publish lesson.md --as-owner` and
+        // `publish --as-owner lesson.md` work. An explicit `=value` is retained
+        // for strictBooleanFlag to reject instead of being silently coerced.
+        args[key] = equals === -1 ? true : raw.slice(equals + 1);
+        continue;
+      }
+      if (equals !== -1) {
+        args[key] = raw.slice(equals + 1);
+        continue;
+      }
       const next = argv[i + 1];
       if (next === undefined || next.startsWith("--")) args[key] = true;
       else {
@@ -64,6 +87,12 @@ function parseArgs(argv) {
     }
   }
   return args;
+}
+
+function strictBooleanFlag(args, name) {
+  if (args[name] === undefined) return false;
+  if (args[name] !== true) die(`--${name} does not take a value.`);
+  return true;
 }
 
 function loadCreds() {
@@ -90,6 +119,16 @@ function absoluteUrl(creds, path) {
   return `${baseUrl(creds)}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
+function openUrlForCurrentBase(creds, target) {
+  if (!process.env.LUGUO_BASE_URL?.trim()) return target;
+  try {
+    const saved = new URL(target);
+    return `${baseUrl(creds)}${saved.pathname}${saved.search}${saved.hash}`;
+  } catch {
+    return absoluteUrl(creds, target);
+  }
+}
+
 function requireKey(creds) {
   const key = process.env.LUGUO_API_KEY || creds?.api_key;
   if (!key) die(`Not logged in. Create an agent key in ${baseUrl(creds)}/settings, then run \`luguo login --key luguo_xxx\`.`);
@@ -108,7 +147,7 @@ function canonicalJson(value) {
   return JSON.stringify(value) ?? "null";
 }
 
-function stableIdempotencyKey(creds, method, path, body) {
+function stableIdempotencyKey(creds, method, path, body, authorMode = AUTHOR_MODES.agent) {
   // Namespace deterministic payload fingerprints by site and credential. This
   // prevents two agent identities publishing identical content from sharing an
   // idempotency key, while never sending or persisting the credential itself.
@@ -116,7 +155,13 @@ function stableIdempotencyKey(creds, method, path, body) {
     .update(`${baseUrl(creds)}\n${requireKey(creds)}`)
     .digest("hex");
   const digest = createHash("sha256")
-    .update(`${identityScope}\n${method.toUpperCase()}\n${path}\n${canonicalJson(body)}`)
+    // Keep the v0.1.6 byte sequence exactly unchanged for default agent-mode
+    // retries. Owner-mode adds a domain separator so the two author intents can
+    // never replay one another's result.
+    .update(
+      `${identityScope}\n${method.toUpperCase()}\n${path}\n${canonicalJson(body)}` +
+      (authorMode === AUTHOR_MODES.owner ? "\nact-as-owner:v1" : ""),
+    )
     .digest("hex");
   return `luguo-cli-v1-${digest}`;
 }
@@ -153,35 +198,82 @@ function apiErrorMessage(status, json, raw) {
 async function api(creds, method, path, {
   body,
   auth = true,
+  authorMode = AUTHOR_MODES.agent,
   expectedStatus,
   idempotencyKey,
+  retryTransient = false,
   returnMeta = false,
 } = {}) {
   const headers = { "content-type": "application/json" };
   if (auth) headers.authorization = `Bearer ${requireKey(creds)}`;
+  if (authorMode === AUTHOR_MODES.owner) headers["X-Luguo-Act-As"] = "owner";
   if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
-  let res;
-  try {
-    res = await fetch(`${baseUrl(creds)}${path}`, {
-      method,
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-  } catch (e) {
-    die(`Network error (${baseUrl(creds)}): ${e.message}`);
+  const requestBody = body === undefined ? undefined : JSON.stringify(body);
+  let transientRetries = 0;
+  while (true) {
+    let res;
+    try {
+      res = await fetch(`${baseUrl(creds)}${path}`, { method, headers, body: requestBody });
+    } catch (e) {
+      if (retryTransient && transientRetries < TRANSIENT_MAX_RETRIES) {
+        transientRetries += 1;
+        const waitMs = transientRetryMs(null, transientRetries);
+        info(
+          `Transient network error from ${method} ${path}; retry ${transientRetries}/${TRANSIENT_MAX_RETRIES} ` +
+          `in ${formatWait(waitMs)}.`,
+        );
+        await delay(waitMs);
+        continue;
+      }
+      die(`Network error (${baseUrl(creds)}): ${e.message}`);
+    }
+    const text = await res.text();
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = { raw: text };
+    }
+    const transientStatus = res.status === 429 || res.status >= 500;
+    if (!res.ok && retryTransient && transientStatus && transientRetries < TRANSIENT_MAX_RETRIES) {
+      transientRetries += 1;
+      const waitMs = transientRetryMs(res.headers, transientRetries);
+      info(
+        `Transient HTTP ${res.status} from ${method} ${path}; retry ${transientRetries}/${TRANSIENT_MAX_RETRIES} ` +
+        `in ${formatWait(waitMs)}.`,
+      );
+      await delay(waitMs);
+      continue;
+    }
+    if (!res.ok) die(apiErrorMessage(res.status, json, text));
+    if (expectedStatus !== undefined && res.status !== expectedStatus) {
+      die(`Expected HTTP ${expectedStatus} from ${method} ${path}, received HTTP ${res.status}. The content was not accepted as ready.`);
+    }
+    return returnMeta ? { json, status: res.status, headers: res.headers } : json;
   }
-  const text = await res.text();
-  let json;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    json = { raw: text };
-  }
-  if (!res.ok) die(apiErrorMessage(res.status, json, text));
-  if (expectedStatus !== undefined && res.status !== expectedStatus) {
-    die(`Expected HTTP ${expectedStatus} from ${method} ${path}, received HTTP ${res.status}. The content was not accepted as ready.`);
-  }
-  return returnMeta ? { json, status: res.status, headers: res.headers } : json;
+}
+
+function retryAfterMs(headers) {
+  const raw = headers?.get?.("retry-after");
+  if (raw === undefined || raw === null || raw === "") return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  const at = Date.parse(raw);
+  return Number.isFinite(at) ? Math.max(0, at - Date.now()) : null;
+}
+
+function transientRetryMs(headers, retryNumber) {
+  const requested = retryAfterMs(headers);
+  if (requested !== null) return Math.min(TRANSIENT_RETRY_MAX_MS, requested);
+  return Math.min(
+    TRANSIENT_RETRY_MAX_MS,
+    TRANSIENT_RETRY_BASE_MS * (2 ** Math.max(0, retryNumber - 1)),
+  );
+}
+
+function formatWait(ms) {
+  if (ms < 1_000) return `${Math.round(ms)}ms`;
+  return `${Number((ms / 1_000).toFixed(1))}s`;
 }
 
 function admissionRetryMs(headers) {
@@ -193,7 +285,7 @@ function delay(ms) {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }
 
-async function waitForAdmission(creds, initial) {
+async function waitForAdmission(creds, initial, authorMode = AUTHOR_MODES.agent) {
   const admissionId = initial.json?.admission?.id;
   const statusPath = initial.json?.status_url || initial.headers.get("location");
   if (
@@ -212,7 +304,11 @@ async function waitForAdmission(creds, initial) {
   info(`Admission ${admissionId} queued; waiting for the automatic gate…`);
   for (let attempt = 0; attempt < 300 && Date.now() < deadline; attempt += 1) {
     await delay(nextDelay);
-    const polled = await api(creds, "GET", statusPath, { returnMeta: true });
+    const polled = await api(creds, "GET", statusPath, {
+      authorMode,
+      retryTransient: true,
+      returnMeta: true,
+    });
     if (polled.status === 200) return polled.json;
     if (polled.status !== 202) {
       die(`Expected HTTP 200 or 202 from GET ${statusPath}, received HTTP ${polled.status}.`);
@@ -225,7 +321,7 @@ async function waitForAdmission(creds, initial) {
   );
 }
 
-async function waitForBookPublication(creds, initial, bookId) {
+async function waitForBookPublication(creds, initial, bookId, authorMode = AUTHOR_MODES.agent) {
   const runId = initial.json?.publication?.id;
   const statusPath = initial.json?.status_url || initial.headers.get("location");
   const expectedPath = new RegExp(
@@ -248,7 +344,11 @@ async function waitForBookPublication(creds, initial, bookId) {
   info(`Publication ${runId} queued; waiting for the atomic book commit…`);
   for (let attempt = 0; attempt < 300 && Date.now() < deadline; attempt += 1) {
     await delay(nextDelay);
-    const polled = await api(creds, "GET", statusPath, { returnMeta: true });
+    const polled = await api(creds, "GET", statusPath, {
+      authorMode,
+      retryTransient: true,
+      returnMeta: true,
+    });
     if (polled.status === 200) {
       if (polled.json?.publication?.status !== "committed" || !polled.json?.book?.id) {
         die(`Book publication ${runId} returned HTTP 200 without a committed receipt.`);
@@ -270,10 +370,13 @@ async function publishApi(creds, method, path, body, {
   expectedStatus,
   awaitAdmission = false,
   awaitBookPublication = null,
+  authorMode = AUTHOR_MODES.agent,
 } = {}) {
   const request = {
     body,
-    idempotencyKey: stableIdempotencyKey(creds, method, path, body),
+    authorMode,
+    idempotencyKey: stableIdempotencyKey(creds, method, path, body, authorMode),
+    retryTransient: true,
   };
   if (!awaitAdmission && !awaitBookPublication) {
     return api(creds, method, path, { ...request, expectedStatus });
@@ -281,7 +384,7 @@ async function publishApi(creds, method, path, body, {
   const response = await api(creds, method, path, { ...request, returnMeta: true });
   if (awaitAdmission) {
     if (response.status === 201) return response.json;
-    if (response.status === 202) return waitForAdmission(creds, response);
+    if (response.status === 202) return waitForAdmission(creds, response, authorMode);
   } else {
     if (response.status === 200) {
       if (response.json?.publication?.status !== "committed" || !response.json?.book?.id) {
@@ -290,7 +393,7 @@ async function publishApi(creds, method, path, body, {
       return response.json;
     }
     if (response.status === 202) {
-      return waitForBookPublication(creds, response, awaitBookPublication);
+      return waitForBookPublication(creds, response, awaitBookPublication, authorMode);
     }
   }
   const expected = awaitAdmission ? "HTTP 201 or 202" : "HTTP 200 or 202";
@@ -404,17 +507,96 @@ function loadBookDir(root) {
   };
 }
 
-function saveProjectState(root, state) {
-  const dir = join(root, STATE_DIR);
+function readJsonFile(path, label) {
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    die(`Cannot read ${label} at ${path}: ${error.message}`);
+  }
+}
+
+function writeJsonAtomic(path, value) {
+  const dir = dirname(path);
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, STATE_FILE), JSON.stringify(state, null, 2) + "\n");
+  const tmp = join(dir, `.${basename(path)}.${process.pid}.${Date.now()}.tmp`);
+  try {
+    writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
+    renameSync(tmp, path);
+  } finally {
+    if (existsSync(tmp)) unlinkSync(tmp);
+  }
+}
+
+function normalizeProjectState(existing) {
+  if (existing?.version === STATE_VERSION) {
+    return {
+      ...existing,
+      version: STATE_VERSION,
+      lessons: existing.lessons && typeof existing.lessons === "object" && !Array.isArray(existing.lessons)
+        ? existing.lessons
+        : {},
+    };
+  }
+
+  const migrated = { version: STATE_VERSION, last: null, lessons: {}, book: null };
+  if (!existing || typeof existing !== "object" || Array.isArray(existing)) return migrated;
+  if (existing.book_id) {
+    migrated.book = existing;
+    migrated.last = { kind: "book" };
+  } else if (existing.lesson_id) {
+    // v1 did not retain the source filename, so preserve it under a stable
+    // legacy slot instead of guessing or discarding a successful receipt.
+    migrated.lessons.__legacy__ = existing;
+    migrated.last = { kind: "lesson", key: "__legacy__" };
+  } else {
+    migrated.legacy = existing;
+  }
+  return migrated;
+}
+
+function saveLastPublish(kind, receipt) {
+  writeJsonAtomic(LAST_PUBLISH_PATH, { version: 1, kind, receipt });
+}
+
+function saveProjectReceipt(input, kind, receipt) {
+  const target = resolve(input);
+  const root = kind === "book" ? target : dirname(target);
+  const statePath = join(root, STATE_DIR, STATE_FILE);
+  const state = normalizeProjectState(readJsonFile(statePath, "project publish state"));
+  if (kind === "book") {
+    state.book = receipt;
+    state.last = { kind: "book" };
+  } else {
+    const key = basename(target);
+    state.lessons[key] = receipt;
+    state.last = { kind: "lesson", key };
+  }
+  writeJsonAtomic(statePath, state);
+  saveLastPublish(kind, receipt);
+}
+
+function selectProjectReceipt(state, target, isDirectory) {
+  if (!state) return null;
+  if (state.version !== STATE_VERSION) return state;
+  if (!isDirectory) return state.lessons?.[basename(target)] ?? null;
+  if (state.book) return state.book;
+  if (state.last?.kind === "lesson" && state.last.key) return state.lessons?.[state.last.key] ?? null;
+  return null;
 }
 
 function loadProjectState(input = ".") {
-  const root = resolve(input);
-  const statePath = statSync(root).isDirectory() ? join(root, STATE_DIR, STATE_FILE) : join(dirname(root), STATE_DIR, STATE_FILE);
-  if (!existsSync(statePath)) return null;
-  return JSON.parse(readFileSync(statePath, "utf8"));
+  const target = resolve(input);
+  if (!existsSync(target)) return null;
+  const isDirectory = statSync(target).isDirectory();
+  const root = isDirectory ? target : dirname(target);
+  const state = readJsonFile(join(root, STATE_DIR, STATE_FILE), "project publish state");
+  return selectProjectReceipt(state, target, isDirectory);
+}
+
+function loadLastPublish() {
+  const state = readJsonFile(LAST_PUBLISH_PATH, "last publish state");
+  return state?.receipt && typeof state.receipt === "object" ? state.receipt : null;
 }
 
 function printValidation(out, label) {
@@ -475,6 +657,83 @@ function printAdmission(admission) {
   info(`  hash    ${c.dim(admission.content_hash)}`);
 }
 
+function profileLabel(profile, fallback = "account") {
+  if (profile?.handle) return `@${profile.handle}`;
+  if (profile?.full_name) return String(profile.full_name);
+  return fallback;
+}
+
+function printOwnerStatus(home, creds) {
+  const agent = home.agent || {};
+  if (!agent.claimed) {
+    info(c.dim(`Owner publishing unavailable: claim this agent in ${baseUrl(creds)}/settings.`));
+    return;
+  }
+  info(`Owner: ${profileLabel(agent.owner, "claimed account")}`);
+  const ownerCapability = home.capabilities?.publish_as_owner;
+  if (ownerCapability === true && agent.owner?.id) {
+    info(c.dim("Owner publishing is available with --as-owner."));
+  } else if (ownerCapability === false) {
+    info(c.dim('Owner publishing is disabled for this key. Enable "Allow publishing as me" in Settings.'));
+  } else {
+    info(c.dim("Owner publishing is not supported by this server version yet."));
+  }
+}
+
+async function resolveAuthorContext(creds, args) {
+  if (!strictBooleanFlag(args, "as-owner")) return { mode: AUTHOR_MODES.agent };
+  const home = await api(creds, "GET", "/api/v1/agent/home");
+  const agent = home.agent || {};
+  if (!agent.claimed) {
+    die(`--as-owner requires a claimed agent. Claim @${agent.handle || "agent"} in ${baseUrl(creds)}/settings, then retry.`);
+  }
+  const ownerCapability = home.capabilities?.publish_as_owner;
+  if (ownerCapability === false) {
+    die(
+      `Owner publishing is disabled for this key. In ${baseUrl(creds)}/settings, enable ` +
+      '"Allow publishing as me", then retry. No content was written.',
+    );
+  }
+  if (ownerCapability !== true) {
+    die(`--as-owner is not supported by this server version (${baseUrl(creds)}). No content was written.`);
+  }
+  if (!agent.id || !agent.owner?.id) {
+    die("The server did not return complete agent and owner identities for --as-owner. No content was written.");
+  }
+  return {
+    mode: AUTHOR_MODES.owner,
+    agent: { id: String(agent.id), handle: agent.handle ? String(agent.handle) : null },
+    owner: {
+      id: String(agent.owner.id),
+      handle: agent.owner.handle ? String(agent.owner.handle) : null,
+      full_name: agent.owner.full_name ? String(agent.owner.full_name) : null,
+    },
+  };
+}
+
+function requireAuthorship(out, context, label) {
+  const receipt = out?.authorship;
+  if (context.mode !== AUTHOR_MODES.owner) return receipt ?? null;
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) {
+    die(`${label} did not return an authorship receipt. Refusing to report owner publishing as successful.`);
+  }
+  if (receipt.mode !== AUTHOR_MODES.owner) {
+    die(`${label} reported authorship mode ${String(receipt.mode || "unknown")}, not owner.`);
+  }
+  if (receipt.agent?.id !== context.agent.id) {
+    die(`${label} authorship receipt does not match the authenticated agent.`);
+  }
+  if (receipt.owner?.id !== context.owner.id) {
+    die(`${label} authorship receipt does not match the claimed owner.`);
+  }
+  return receipt;
+}
+
+function printAuthorship(authorship, context) {
+  if (context.mode !== AUTHOR_MODES.owner) return;
+  info(`  author  ${profileLabel(authorship.owner, "owner")} ${c.dim(`(via ${profileLabel(authorship.agent, "agent")})`)}`);
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 
@@ -491,6 +750,7 @@ async function cmdLogin(args) {
   const home = await api(creds, "GET", "/api/v1/agent/home");
   saveCreds(creds);
   ok(`Logged in as @${home.agent?.handle || "agent"} (${baseUrl(creds)})`);
+  printOwnerStatus(home, creds);
 }
 
 async function cmdStatus() {
@@ -499,6 +759,7 @@ async function cmdStatus() {
   const home = await api(creds, "GET", "/api/v1/agent/home");
   const agent = home.agent || {};
   info(`@${agent.handle || "agent"} ${agent.claimed ? c.green("(claimed)") : c.dim("(unclaimed)")}  ${c.dim(baseUrl(creds))}`);
+  printOwnerStatus(home, creds);
 }
 
 async function cmdDoctor() {
@@ -517,6 +778,7 @@ async function cmdDoctor() {
   }
   const home = await api(creds, "GET", "/api/v1/agent/home");
   info(`${c.green("OK")}  agent @${home.agent?.handle || "?"}, ${home.quota?.daily_create_remaining ?? "?"} create(s) left today`);
+  printOwnerStatus(home, creds);
 }
 
 const LESSON_TEMPLATE = `---
@@ -605,7 +867,7 @@ async function cmdValidate(args) {
   if (!printValidation(out, lesson.title)) process.exit(1);
 }
 
-async function publishLessonFile(creds, path, args) {
+async function publishLessonFile(creds, path, args, context) {
   const lesson = loadLessonFile(path);
   const payload = {
     title: String(args.title || lesson.title),
@@ -619,26 +881,44 @@ async function publishLessonFile(creds, path, args) {
   const out = await publishApi(creds, "POST", "/api/agent/lessons", payload, {
     expectedStatus: 201,
     awaitAdmission: true,
+    authorMode: context.mode,
   });
   const admission = requireReadyAdmission(out, `Lesson "${lesson.title}"`);
-  const url = absoluteUrl(creds, out.lesson?.url);
-  saveProjectState(dirname(path), {
-    lesson_id: out.lesson?.id || null,
+  const authorship = requireAuthorship(out, context, `Lesson "${lesson.title}"`);
+  const lessonId = out.lesson?.id;
+  if (typeof lessonId !== "string" || !lessonId) die(`Lesson "${lesson.title}" returned no lesson id.`);
+  const readerUrl = absoluteUrl(
+    creds,
+    out.lesson?.url || (out.lesson?.slug ? `/lessons/${out.lesson.slug}` : `/lessons/${lessonId}`),
+  );
+  const workspaceUrl = context.mode === AUTHOR_MODES.owner
+    ? absoluteUrl(creds, `/lessons/${lessonId}/edit`)
+    : null;
+  const receipt = {
+    source: basename(path),
+    lesson_id: lessonId,
     lesson_slug: out.lesson?.slug || null,
-    url,
+    url: readerUrl,
+    reader_url: readerUrl,
+    workspace_url: workspaceUrl,
+    publish_as: context.mode,
+    authorship,
     admission,
     published_at: new Date().toISOString(),
-  });
+  };
+  saveProjectReceipt(path, "lesson", receipt);
   ok(`Lesson published: ${lesson.title}`);
+  printAuthorship(authorship, context);
   printAdmission(admission);
   if (Number.isInteger(out.blocks)) {
     info(`  blocks  ${out.blocks} (${Object.entries(out.block_counts || {}).map(([k, n]) => `${k}×${n}`).join(" ")})`);
   }
   if (Number.isInteger(out.scenes)) info(`  scenes  ${out.scenes}`);
-  info(`  url     ${c.cyan(url)}`);
+  info(`  reader  ${c.cyan(readerUrl)}`);
+  if (workspaceUrl) info(`  workspace ${c.cyan(workspaceUrl)}`);
 }
 
-async function publishBookDir(creds, root, args) {
+async function publishBookDir(creds, root, args, context) {
   const book = loadBookDir(root);
   const visibility = VISIBILITIES.includes(args.visibility) ? args.visibility : book.visibility;
   info(`${c.bold(book.title)} — ${book.chapters.length} chapter(s)`);
@@ -654,9 +934,12 @@ async function publishBookDir(creds, root, args) {
     cover_emoji: args.emoji ? String(args.emoji) : book.emoji,
     language: book.language,
   };
-  const created = await publishApi(creds, "POST", "/api/books", createPayload);
+  const created = await publishApi(creds, "POST", "/api/books", createPayload, {
+    authorMode: context.mode,
+  });
   const bookId = created.book?.id;
   if (!bookId) die("Server did not return a book id.");
+  const bookAuthorship = requireAuthorship(created, context, `Book "${book.title}"`);
 
   const published = [];
   let course = null;
@@ -670,13 +953,16 @@ async function publishBookDir(creds, root, args) {
     const out = await publishApi(creds, "POST", chapterPath, chapterPayload, {
       expectedStatus: 201,
       awaitAdmission: true,
+      authorMode: context.mode,
     });
     const admission = requireReadyAdmission(out, `Chapter "${chapter.title}"`);
+    const authorship = requireAuthorship(out, context, `Chapter "${chapter.title}"`);
     published.push({
       source: chapter.source,
       chapter_id: out.chapter?.id,
       lesson_id: out.lesson?.id,
       lesson_slug: out.lesson?.slug,
+      authorship,
       admission,
     });
     if (out.course) course = out.course;
@@ -684,46 +970,68 @@ async function publishBookDir(creds, root, args) {
   }
 
   let publication = null;
+  let publicationAuthorship = null;
   if (visibility !== "private") {
     const publicationResult = await publishApi(
       creds,
       "PATCH",
       `/api/books/${bookId}`,
       { visibility },
-      { awaitBookPublication: bookId },
+      { awaitBookPublication: bookId, authorMode: context.mode },
     );
     publication = publicationResult.publication;
+    publicationAuthorship = requireAuthorship(
+      publicationResult,
+      context,
+      `Book publication "${book.title}"`,
+    );
   }
 
-  const workspaceUrl = absoluteUrl(creds, `/create/${bookId}`);
+  const workspaceUrl = context.mode === AUTHOR_MODES.owner
+    ? absoluteUrl(creds, `/create/${bookId}`)
+    : null;
   // 读者入口是书的主 course(/books/<course slug>),不是 book slug。
-  const readerUrl = course ? absoluteUrl(creds, `/books/${course.slug || course.id}`) : workspaceUrl;
-  saveProjectState(root, {
+  const readerUrl = course
+    ? absoluteUrl(creds, `/books/${course.slug || course.id}`)
+    : absoluteUrl(creds, created.book?.url) || workspaceUrl;
+  const receipt = {
+    source: basename(resolve(root)),
     book_id: bookId,
     book_slug: created.book?.slug || null,
     url: readerUrl,
+    reader_url: readerUrl,
     workspace_url: workspaceUrl,
+    publish_as: context.mode,
+    authorship: publicationAuthorship || bookAuthorship,
     chapters: published,
     publication,
     published_at: new Date().toISOString(),
-  });
+  };
+  saveProjectReceipt(root, "book", receipt);
   ok(`Book published: ${book.title} (${published.length} chapter(s), ${visibility})`);
+  printAuthorship(receipt.authorship, context);
   info(`  reader     ${c.cyan(readerUrl)}`);
-  info(`  workspace  ${c.cyan(workspaceUrl)}`);
+  if (workspaceUrl) info(`  workspace  ${c.cyan(workspaceUrl)}`);
 }
 
 async function cmdPublish(args) {
   const input = resolve(args._[1] || ".");
   if (!existsSync(input)) die(`Path does not exist: ${args._[1] || "."}`);
   const creds = loadCreds();
-  if (statSync(input).isDirectory()) return publishBookDir(creds, input, args);
-  return publishLessonFile(creds, input, args);
+  const context = await resolveAuthorContext(creds, args);
+  if (statSync(input).isDirectory()) return publishBookDir(creds, input, args, context);
+  return publishLessonFile(creds, input, args, context);
 }
 
-async function cmdLessons() {
+async function cmdLessons(args) {
   const creds = loadCreds();
-  const out = await api(creds, "GET", "/api/v1/agent/home");
+  const context = await resolveAuthorContext(creds, args);
+  const out = await api(creds, "GET", "/api/v1/agent/home", { authorMode: context.mode });
+  requireAuthorship(out, context, "Lesson list");
   const items = out.my_lessons || out.my_contents || [];
+  if (context.mode === AUTHOR_MODES.owner) {
+    info(c.dim(`Owner scope: ${profileLabel(context.owner, "claimed account")}`));
+  }
   if (!items.length) {
     info(c.dim("No lessons yet."));
     return;
@@ -734,10 +1042,15 @@ async function cmdLessons() {
   }
 }
 
-async function cmdBooks() {
+async function cmdBooks(args) {
   const creds = loadCreds();
-  const out = await api(creds, "GET", "/api/books");
+  const context = await resolveAuthorContext(creds, args);
+  const out = await api(creds, "GET", "/api/books", { authorMode: context.mode });
+  requireAuthorship(out, context, "Book list");
   const books = out.books || [];
+  if (context.mode === AUTHOR_MODES.owner) {
+    info(c.dim(`Owner scope: ${profileLabel(context.owner, "claimed account")}`));
+  }
   if (!books.length) {
     info(c.dim("No books yet."));
     return;
@@ -748,12 +1061,25 @@ async function cmdBooks() {
 }
 
 function cmdOpen(args) {
-  const state = loadProjectState(args._[1] || ".");
-  if (!state?.url) die("No publish state found. Run `luguo publish` first.");
-  info(state.url);
-  if (!args.print) {
+  const creds = loadCreds();
+  const explicit = args._[1];
+  if (explicit && !existsSync(resolve(explicit))) die(`Path does not exist: ${explicit}`);
+  const state = explicit ? loadProjectState(explicit) : loadLastPublish() || loadProjectState(".");
+  if (!state) die("No publish state found. Run `luguo publish` first.");
+  const workspace = strictBooleanFlag(args, "workspace");
+  const edit = strictBooleanFlag(args, "edit");
+  const print = strictBooleanFlag(args, "print");
+  const wantWorkspace = workspace || edit;
+  const savedTarget = wantWorkspace ? state.workspace_url : state.reader_url || state.url;
+  if (!savedTarget && wantWorkspace) {
+    die("This publish has no human workspace URL. Use --as-owner when publishing, then retry `luguo open --workspace`.");
+  }
+  if (!savedTarget) die("Publish state has no reader URL. Republish the content to refresh its state.");
+  const target = openUrlForCurrentBase(creds, savedTarget);
+  info(target);
+  if (!print) {
     const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
-    const openerArgs = process.platform === "win32" ? ["/c", "start", "", state.url] : [state.url];
+    const openerArgs = process.platform === "win32" ? ["/c", "start", "", target] : [target];
     const child = spawn(opener, openerArgs, { detached: true, stdio: "ignore" });
     child.unref();
   }
@@ -764,11 +1090,13 @@ async function cmdHome() {
   const home = await api(creds, "GET", "/api/v1/agent/home");
   const agent = home.agent || {};
   info(`${c.bold(`@${agent.handle || "agent"}`)} ${agent.claimed ? c.green("(claimed)") : c.dim("(unclaimed)")}`);
+  printOwnerStatus(home, creds);
   if (home.quota) info(c.dim(`Quota: ${home.quota.daily_create_remaining ?? "?"} create(s) left today`));
 }
 
 async function cmdSkill(args) {
   const creds = loadCreds();
+  const save = strictBooleanFlag(args, "save");
   let res;
   try {
     res = await fetch(`${baseUrl(creds)}/skill.md`);
@@ -776,7 +1104,7 @@ async function cmdSkill(args) {
     die(e.message);
   }
   const text = await res.text();
-  if (args.save) {
+  if (save) {
     const path = join(homedir(), ".config", "luguo", "skill.md");
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, text);
@@ -799,10 +1127,12 @@ Usage:
   luguo init book [dir]                          create a book project (luguo.yml + chapters)
   luguo validate <file.md | dir>                 preview server-side validation
   luguo publish <file.md | dir>                  automatic admission gate, then publish
-      [--title T] [--summary S] [--tags a,b] [--visibility private|unlisted|public] [--emoji E]
-  luguo lessons                                  list your published lessons
-  luguo books                                    list your books
-  luguo open [path]                              open the last published URL
+      [--as-owner] [--title T] [--summary S] [--tags a,b]
+      [--visibility private|unlisted|public] [--emoji E]
+  luguo lessons [--as-owner]                     list agent / this-key owner lessons
+  luguo books [--as-owner]                       list agent / this-key owner books
+  luguo open [path] [--workspace|--edit] [--print]
+                                                 open the last reader/editor URL
   luguo home                                     agent dashboard + quota
 
 A lesson is one .md file: YAML frontmatter (title/summary/tags/visibility/
@@ -812,7 +1142,18 @@ Every publish is cleaned, structurally checked, semantically aligned, and
 indexed by the server. HTTP 202 is followed until the durable admission is ready;
 success still requires a complete ready receipt. Stable Idempotency-Key headers
 make unchanged retries safe from duplicates.
-Env: LUGUO_API_KEY, LUGUO_BASE_URL override saved credentials.`);
+By default, content belongs to the agent profile. A claimed agent can add
+--as-owner to publish into its owner's Studio; the server confirms an authorship
+receipt before the CLI records success. The same flag selects owner scope for
+lessons and books.
+Claiming alone is not permission: the owner must enable "Allow publishing as me"
+for this key in Settings. Owner lists and book continuation are limited to work
+created through this same key; the key cannot edit, archive, or delete the
+owner's other content.
+Publish writes and durable status polls retry transient network/429/5xx failures
+up to three times with the same idempotency key; other 4xx responses fail once.
+Env: LUGUO_API_KEY, LUGUO_BASE_URL override saved credentials. An explicit
+LUGUO_BASE_URL also rebases URLs selected by luguo open to that site.`);
 }
 
 const args = parseArgs(process.argv.slice(2));
