@@ -27,7 +27,11 @@ const STATE_FILE = "state.json";
 const STATE_VERSION = 2;
 const VISIBILITIES = ["private", "public", "unlisted"];
 const AUTHOR_MODES = { agent: "agent", owner: "owner" };
-const BOOLEAN_FLAGS = new Set(["as-owner", "workspace", "edit", "print", "save"]);
+const BOOLEAN_FLAGS = new Set([
+  "as-owner", "workspace", "edit", "print", "save",
+  "json", "open", "force", "yes", "all", "new",
+]);
+const CRED_VERSION = 2;
 const TRANSIENT_MAX_RETRIES = 3;
 const TRANSIENT_RETRY_BASE_MS = 500;
 const TRANSIENT_RETRY_MAX_MS = 30_000;
@@ -95,18 +99,77 @@ function strictBooleanFlag(args, name) {
   return true;
 }
 
-function loadCreds() {
-  if (!existsSync(CRED_PATH)) return null;
+// Credential store v2: named contexts (like kubectl/gh), one per site+key.
+// v1 files ({api_key, base_url}) are read as a single "default" context and
+// migrate to v2 on the next write. LUGUO_CONTEXT selects a context per-run.
+function normalizeCredStore(raw) {
+  if (raw && raw.version === CRED_VERSION && raw.contexts && typeof raw.contexts === "object" && !Array.isArray(raw.contexts)) {
+    const contexts = {};
+    for (const [name, ctx] of Object.entries(raw.contexts)) {
+      if (ctx && typeof ctx === "object" && typeof ctx.api_key === "string") contexts[name] = ctx;
+    }
+    const current = typeof raw.current === "string" && contexts[raw.current] ? raw.current : Object.keys(contexts)[0] ?? null;
+    return { version: CRED_VERSION, current, contexts };
+  }
+  if (raw && typeof raw.api_key === "string") {
+    const ctx = { api_key: raw.api_key };
+    if (typeof raw.base_url === "string") ctx.base_url = raw.base_url;
+    return { version: CRED_VERSION, current: "default", contexts: { default: ctx } };
+  }
+  return { version: CRED_VERSION, current: null, contexts: {} };
+}
+
+function loadCredStore() {
+  if (!existsSync(CRED_PATH)) return normalizeCredStore(null);
   try {
-    return JSON.parse(readFileSync(CRED_PATH, "utf8"));
+    return normalizeCredStore(JSON.parse(readFileSync(CRED_PATH, "utf8")));
   } catch {
-    return null;
+    return normalizeCredStore(null);
   }
 }
 
-function saveCreds(creds) {
+function saveCredStore(store) {
   mkdirSync(dirname(CRED_PATH), { recursive: true });
-  writeFileSync(CRED_PATH, JSON.stringify(creds, null, 2) + "\n", { mode: 0o600 });
+  writeFileSync(CRED_PATH, JSON.stringify(store, null, 2) + "\n", { mode: 0o600 });
+}
+
+function loadCreds() {
+  const store = loadCredStore();
+  const requested = process.env.LUGUO_CONTEXT;
+  if (requested) {
+    const ctx = store.contexts[requested];
+    if (!ctx) die(`Unknown context "${requested}" (LUGUO_CONTEXT). Run \`luguo context\` to list contexts.`);
+    return { ...ctx, context: requested };
+  }
+  if (!store.current) return null;
+  const ctx = store.contexts[store.current];
+  return ctx ? { ...ctx, context: store.current } : null;
+}
+
+function saveContext(name, ctx, { use = true } = {}) {
+  const store = loadCredStore();
+  store.contexts[name] = ctx;
+  if (use || !store.current) store.current = name;
+  saveCredStore(store);
+}
+
+// Derive a stable context name: --context wins, then the --env alias, then the
+// site hostname, so `login --env dev` and `login --env prod` coexist naturally.
+function contextNameFor(args, base) {
+  if (args.context) return String(args.context);
+  if (args.env) {
+    const env = String(args.env).toLowerCase();
+    return env === "production" ? "prod" : env;
+  }
+  try {
+    const host = new URL(base).hostname;
+    if (host === "luguo.ai") return "prod";
+    if (host === "dev.luguo.ai") return "dev";
+    if (host === "localhost" || host === "127.0.0.1") return "local";
+    return host;
+  } catch {
+    return "default";
+  }
 }
 
 function baseUrl(creds) {
@@ -132,8 +195,64 @@ function openUrlForCurrentBase(creds, target) {
 
 function requireKey(creds) {
   const key = process.env.LUGUO_API_KEY || creds?.api_key;
-  if (!key) die(`Not logged in. Create an agent key in ${baseUrl(creds)}/settings, then run \`luguo login --key luguo_xxx\`.`);
+  if (!key) die(`Not logged in. Create an agent key in ${baseUrl(creds)}/settings, then run \`luguo login\`.`);
   return key;
+}
+
+// Hidden interactive prompt (for pasting API keys). Returns null on non-TTY so
+// scripted callers keep failing fast with the usage error instead of hanging.
+function promptHidden(question) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return Promise.resolve(null);
+  process.stdout.write(question);
+  return new Promise((resolvePrompt) => {
+    const { stdin } = process;
+    let value = "";
+    const cleanup = () => {
+      stdin.setRawMode(false);
+      stdin.pause();
+      stdin.off("data", onData);
+    };
+    const onData = (chunk) => {
+      const ch = String(chunk);
+      if (ch === "\r" || ch === "\n" || ch === "") {
+        cleanup();
+        process.stdout.write("\n");
+        resolvePrompt(value.trim());
+      } else if (ch === "\u0003") {
+        cleanup();
+        process.stdout.write("\n");
+        process.exit(130);
+      } else if (ch === "" || ch === "\b") {
+        value = value.slice(0, -1);
+      } else {
+        value += ch;
+      }
+    };
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.setEncoding("utf8");
+    stdin.on("data", onData);
+  });
+}
+
+// Visible yes/no confirmation. Non-TTY returns false so destructive commands
+// require an explicit --yes in automation.
+function promptConfirm(question) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return Promise.resolve(false);
+  process.stdout.write(`${question} [y/N] `);
+  return new Promise((resolvePrompt) => {
+    const { stdin } = process;
+    stdin.resume();
+    stdin.setEncoding("utf8");
+    stdin.once("data", (chunk) => {
+      stdin.pause();
+      resolvePrompt(/^y(es)?$/i.test(String(chunk).trim()));
+    });
+  });
+}
+
+function printJson(value) {
+  process.stdout.write(JSON.stringify(value, null, 2) + "\n");
 }
 
 function canonicalJson(value) {
@@ -204,6 +323,9 @@ async function api(creds, method, path, {
   idempotencyKey,
   retryTransient = false,
   returnMeta = false,
+  // Statuses the caller wants to handle itself (returned with meta) instead of
+  // the default die(). Lets flows like publish-update fall back on 404/409.
+  allowStatuses = [],
 } = {}) {
   const headers = { "content-type": "application/json" };
   if (auth) headers.authorization = `Bearer ${requireKey(creds)}`;
@@ -245,6 +367,9 @@ async function api(creds, method, path, {
       );
       await delay(waitMs);
       continue;
+    }
+    if (!res.ok && allowStatuses.includes(res.status)) {
+      return { json, status: res.status, headers: res.headers, okStatus: false };
     }
     if (!res.ok) die(apiErrorMessage(res.status, json, text));
     if (expectedStatus !== undefined && res.status !== expectedStatus) {
@@ -738,29 +863,167 @@ function printAuthorship(authorship, context) {
 // ---------------------------------------------------------------------------
 // Commands
 
-async function cmdLogin(args) {
-  const key = args.key || process.env.LUGUO_API_KEY;
-  if (!key) die("Usage: luguo login --key luguo_xxx [--env dev|prod|local] [--base-url URL]");
-  const creds = { api_key: String(key) };
+function baseFromArgs(args) {
+  const ctx = {};
   if (args.env) {
     const url = ENVS[String(args.env).toLowerCase()];
     if (!url) die(`Unknown --env "${args.env}". Use one of: ${Object.keys(ENVS).join(", ")}, or --base-url <url>.`);
-    creds.base_url = url;
+    ctx.base_url = url;
   }
-  if (args["base-url"]) creds.base_url = String(args["base-url"]).replace(/\/+$/, "");
+  if (args["base-url"]) ctx.base_url = String(args["base-url"]).replace(/\/+$/, "");
+  return ctx;
+}
+
+async function loginWithKey(args, key) {
+  if (!/^luguo_[A-Za-z0-9_-]+$/.test(String(key))) {
+    die("That does not look like a luguo agent key (expected the luguo_ prefix).");
+  }
+  const creds = { api_key: String(key), ...baseFromArgs(args) };
   const home = await api(creds, "GET", "/api/v1/agent/home");
-  saveCreds(creds);
-  ok(`Logged in as @${home.agent?.handle || "agent"} (${baseUrl(creds)})`);
+  const name = contextNameFor(args, baseUrl(creds));
+  saveContext(name, creds);
+  ok(`Logged in as @${home.agent?.handle || "agent"} (${baseUrl(creds)}) — context "${name}"`);
   printOwnerStatus(home, creds);
 }
 
-async function cmdStatus() {
+async function cmdLogin(args) {
+  let key = args.key || process.env.LUGUO_API_KEY;
+  if (!key) key = await promptHidden("Agent key (luguo_...): ");
+  if (!key) die("Usage: luguo login [--key luguo_xxx] [--env dev|prod|local] [--base-url URL] [--context NAME]");
+  await loginWithKey(args, key);
+}
+
+function cmdLogout(args) {
+  const store = loadCredStore();
+  if (strictBooleanFlag(args, "all")) {
+    saveCredStore({ version: CRED_VERSION, current: null, contexts: {} });
+    ok("Removed all contexts.");
+    return;
+  }
+  const name = args.context ? String(args.context) : store.current;
+  if (!name || !store.contexts[name]) {
+    die("No matching context to log out from. Run `luguo context` to list contexts.");
+  }
+  delete store.contexts[name];
+  if (store.current === name) store.current = Object.keys(store.contexts)[0] ?? null;
+  saveCredStore(store);
+  ok(`Logged out of context "${name}".${store.current ? ` Now using "${store.current}".` : ""}`);
+}
+
+async function cmdContext(args) {
+  const store = loadCredStore();
+  const sub = args._[1] ?? "list";
+  if (sub === "list") {
+    const names = Object.keys(store.contexts);
+    if (!names.length) {
+      info(c.dim("No contexts. Run `luguo login` or `luguo register`."));
+      return;
+    }
+    if (strictBooleanFlag(args, "json")) {
+      printJson({
+        current: store.current,
+        contexts: Object.fromEntries(names.map((n) => [n, {
+          base_url: store.contexts[n].base_url || DEFAULT_BASE,
+          key_prefix: store.contexts[n].api_key.slice(0, 12),
+        }])),
+      });
+      return;
+    }
+    for (const name of names) {
+      const ctx = store.contexts[name];
+      const marker = name === store.current ? c.green("*") : " ";
+      info(`${marker} ${name.padEnd(12)} ${(ctx.base_url || DEFAULT_BASE).padEnd(28)} ${c.dim(`${ctx.api_key.slice(0, 12)}…`)}`);
+    }
+    return;
+  }
+  if (sub === "use") {
+    const name = args._[2];
+    if (!name || !store.contexts[name]) die(`Unknown context "${name ?? ""}". Run \`luguo context\` to list contexts.`);
+    store.current = name;
+    saveCredStore(store);
+    ok(`Switched to context "${name}" (${store.contexts[name].base_url || DEFAULT_BASE}).`);
+    return;
+  }
+  if (sub === "rm" || sub === "remove") {
+    const name = args._[2];
+    if (!name || !store.contexts[name]) die(`Unknown context "${name ?? ""}".`);
+    delete store.contexts[name];
+    if (store.current === name) store.current = Object.keys(store.contexts)[0] ?? null;
+    saveCredStore(store);
+    ok(`Removed context "${name}".`);
+    return;
+  }
+  die("Usage: luguo context [list] | use <name> | rm <name>");
+}
+
+async function cmdRegister(args) {
+  const name = args.name || args._[1];
+  if (!name) {
+    die("Usage: luguo register --name MyAgent [--description TEXT] [--env dev|prod|local | --base-url URL] [--context NAME] [--open]");
+  }
+  const base = baseUrl(baseFromArgs(args));
+  let res;
+  try {
+    res = await fetch(`${base}/api/v1/agents/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "user-agent": "luguo-cli" },
+      body: JSON.stringify({
+        name: String(name),
+        description: args.description ? String(args.description) : undefined,
+      }),
+    });
+  } catch (e) {
+    die(`Network error (${base}): ${e.message}`);
+  }
+  const json = await res.json().catch(() => ({}));
+  if (res.status === 401) {
+    // Key minting deliberately requires a logged-in human (anti-abuse). Guide
+    // the human through the browser, then finish as a normal login.
+    info(`Registering an agent on ${base} requires a logged-in human.`);
+    info(`1. Open ${c.cyan(`${base}/settings`)} and create an agent (the key starts with luguo_).`);
+    info("2. Paste the key below to bind this CLI.");
+    if (strictBooleanFlag(args, "open")) openInBrowser(`${base}/settings`);
+    const key = await promptHidden("Agent key (luguo_...): ");
+    if (!key) die("No key provided. Re-run `luguo register` or `luguo login` when you have one.");
+    await loginWithKey(args, key);
+    return;
+  }
+  if (!res.ok) die(apiErrorMessage(res.status, json, ""));
+  const key = json.api_key;
+  if (typeof key !== "string" || !key) die("Server did not return an api_key.");
+  const ctxName = contextNameFor(args, base);
+  saveContext(ctxName, { api_key: key, ...baseFromArgs(args) });
+  ok(`Registered @${json.agent_handle || name} — context "${ctxName}" (${base})`);
+  info(c.dim("The key is saved locally; the server cannot show it again."));
+  if (json.claim_url) {
+    info(`Claim URL (send to your human owner): ${c.cyan(json.claim_url)}`);
+    if (strictBooleanFlag(args, "open")) openInBrowser(json.claim_url);
+  }
+}
+
+async function cmdStatus(args) {
   const creds = loadCreds();
-  if (!creds && !process.env.LUGUO_API_KEY) die("Not logged in. Run `luguo login --key luguo_xxx`.");
+  if (!creds && !process.env.LUGUO_API_KEY) die("Not logged in. Run `luguo login`.");
   const home = await api(creds, "GET", "/api/v1/agent/home");
   const agent = home.agent || {};
-  info(`@${agent.handle || "agent"} ${agent.claimed ? c.green("(claimed)") : c.dim("(unclaimed)")}  ${c.dim(baseUrl(creds))}`);
+  if (strictBooleanFlag(args, "json")) {
+    printJson({
+      context: creds?.context ?? null,
+      base_url: baseUrl(creds),
+      agent: {
+        handle: agent.handle ?? null,
+        claimed: Boolean(agent.claimed),
+        owner: agent.owner ?? null,
+      },
+      capabilities: home.capabilities ?? {},
+      quota: home.quota ?? null,
+    });
+    return;
+  }
+  const contextLabel = creds?.context ? `[${creds.context}] ` : "";
+  info(`${contextLabel}@${agent.handle || "agent"} ${agent.claimed ? c.green("(claimed)") : c.dim("(unclaimed)")}  ${c.dim(baseUrl(creds))}`);
   printOwnerStatus(home, creds);
+  if (home.quota) info(c.dim(`Quota: ${home.quota.daily_create_remaining ?? "?"} create(s) left today`));
 }
 
 async function cmdDoctor() {
@@ -792,16 +1055,25 @@ visibility: private
 # 我的第一课
 
 正文是标准 Markdown,支持 $LaTeX$、表格、代码块。
+提问驱动、先让读者预测再揭晓,比平铺定义更有效。
 
 :::keypoints 核心概念
 - **概念 A**: 一句话定义
+:::
+
+:::example 例 1:示范怎么想,不只是怎么算
+题干写在这里。
+@approach 先写"为什么从这里入手"。
+1. 第一步,以及这一步为什么成立。
+2. 第二步。
+@answer 最终答案
 :::
 
 :::quiz 检查题一?
 - [x] 正确选项
 - [ ] 错误选项
 @id q-demo-1
-@explain 为什么正确选项对。
+@explain 为什么正确选项对。数学可用 $...$,也可写纯文本(如 0.2×0.3÷0.4 = 0.15)。
 @skills 概念 A
 @steps 识别条件,应用概念 A,检查结论
 :::
@@ -810,7 +1082,7 @@ visibility: private
 - [ ] 常见误解
 - [x] 正确结论
 @id q-demo-2
-@explain 用另一个场景确认概念 A。
+@explain 用另一个场景确认概念 A。干扰项要对应真实错误,不是随机凑数。
 @skills 概念 A
 @steps 提取信息,比较选项,验证答案
 :::
@@ -822,6 +1094,22 @@ visibility: private
 @explain 把概念 A 迁移到新场景仍得到同一规则。
 @skills 概念 A
 @steps 识别新场景,迁移规则,反例检查
+:::
+
+:::warn 易错点
+写具体的"很多人在这会错成…",而不是空泛的"注意"。
+:::
+
+:::explore 拖一拖:参数如何改变图像(仅数学参数类内容才用)
+@id x-demo-1
+\`\`\`json
+{ "viewBox": { "x": [-10, 10], "y": [-10, 10] },
+  "controls": [
+    { "type": "slider", "var": "m", "label": "斜率 m", "min": -3, "max": 3, "step": 0.5, "default": 1 } ],
+  "items": [
+    { "type": "plot", "expr": "m * x", "domain": [-8, 8], "color": "ink", "label": "y = m·x" },
+    { "type": "readout", "expr": "m", "label": "斜率 m =", "precision": 1 } ] }
+\`\`\`
 :::
 `;
 
@@ -866,6 +1154,90 @@ async function cmdValidate(args) {
   const lesson = loadLessonFile(input);
   const out = await serverValidate(creds, lesson.markdown);
   if (!printValidation(out, lesson.title)) process.exit(1);
+}
+
+function lessonPatchPayload(lesson, args) {
+  return {
+    title: String(args.title || lesson.title),
+    summary: args.summary !== undefined ? String(args.summary) : lesson.summary,
+    tags: normTags(args.tags) ?? lesson.tags,
+    language: lesson.language,
+    cover_emoji: args.emoji ? String(args.emoji) : lesson.emoji,
+    body: { format: "luma-md-v1", markdown: lesson.markdown },
+  };
+}
+
+// PATCH an existing lesson (same admission pipeline server-side). The server
+// treats content revisions and visibility switches as two separate treatments
+// (409 when combined), so send content first and flip scope afterwards.
+async function updateLessonAtId(creds, path, args, { lessonId, mode, saved }) {
+  const lesson = loadLessonFile(path);
+  const apiPath = `/api/lessons/${lessonId}`;
+  const patch = async (body, allowStatuses = []) => {
+    const response = await api(creds, "PATCH", apiPath, {
+      body,
+      authorMode: mode,
+      idempotencyKey: stableIdempotencyKey(creds, "PATCH", apiPath, body, mode),
+      retryTransient: true,
+      returnMeta: true,
+      allowStatuses,
+    });
+    if (response.status === 202) return waitForAdmission(creds, response, mode);
+    return response.okStatus === false ? response : response.json;
+  };
+
+  const payload = lessonPatchPayload(lesson, args);
+  const visibility = VISIBILITIES.includes(args.visibility) ? args.visibility : lesson.visibility;
+  info(`Updating lesson ${c.cyan(lessonId)}${mode === AUTHOR_MODES.owner ? " (as owner)" : ""}…`);
+  let out = await patch({ ...payload, ...(visibility ? { visibility } : {}) }, [403, 404, 409]);
+  if (out.status === 403 && mode === AUTHOR_MODES.owner) {
+    // Older servers only allow owner delegation on create, not manage.
+    die(
+      `${baseUrl(creds)} does not yet allow this key to update owner-published lessons. ` +
+      "Ask the site to upgrade, edit in Studio, or re-run with --new to publish a fresh lesson.",
+    );
+  }
+  if (out.status === 403) die(`HTTP 403: the key is not allowed to update lesson ${lessonId}.`);
+  if (out.status === 404) {
+    die(
+      `Lesson ${lessonId} was not found on ${baseUrl(creds)} (deleted, or created by a different key/site). ` +
+      "Re-run with --new to publish a fresh lesson.",
+    );
+  }
+  if (out.status === 409) {
+    // Content + scope in one request → do the two treatments in order.
+    out = await patch(payload);
+    if (visibility) await patch({ visibility });
+  }
+  const updated = out.lesson ?? {};
+  const readerUrl = saved?.reader_url
+    ?? absoluteUrl(creds, updated.slug ? `/lessons/${updated.slug}` : `/lessons/${lessonId}`);
+  const receipt = {
+    ...(saved ?? {}),
+    source: basename(path),
+    lesson_id: lessonId,
+    lesson_slug: updated.slug ?? saved?.lesson_slug ?? null,
+    url: readerUrl,
+    reader_url: readerUrl,
+    workspace_url: saved?.workspace_url
+      ?? (mode === AUTHOR_MODES.owner ? absoluteUrl(creds, `/lessons/${lessonId}/edit`) : null),
+    publish_as: mode,
+    ...(out.authorship ? { authorship: out.authorship } : {}),
+    ...(out.admission ? { admission: out.admission } : {}),
+    updated_at: new Date().toISOString(),
+    published_at: saved?.published_at ?? new Date().toISOString(),
+  };
+  saveProjectReceipt(path, "lesson", receipt);
+  if (strictBooleanFlag(args, "json")) {
+    printJson(receipt);
+    return;
+  }
+  ok(`Lesson updated: ${payload.title}`);
+  if (out.admission?.gate_version) {
+    info(`  gate    ${out.admission.gate_version} (${out.admission.status ?? "ready"})`);
+  }
+  info(`  reader  ${c.cyan(openUrlForCurrentBase(creds, readerUrl))}`);
+  if (receipt.workspace_url) info(`  workspace ${c.cyan(openUrlForCurrentBase(creds, receipt.workspace_url))}`);
 }
 
 async function publishLessonFile(creds, path, args, context) {
@@ -1019,8 +1391,24 @@ async function cmdPublish(args) {
   const input = resolve(args._[1] || ".");
   if (!existsSync(input)) die(`Path does not exist: ${args._[1] || "."}`);
   const creds = loadCreds();
+  if (statSync(input).isDirectory()) {
+    const context = await resolveAuthorContext(creds, args);
+    return publishBookDir(creds, input, args, context);
+  }
+  // Republish of a known source file updates the existing lesson in place
+  // (PATCH keeps the URL, @id answer history, and knowledge index anchors).
+  // --new forces a fresh lesson; --lesson <id> retargets explicitly.
+  const forceNew = strictBooleanFlag(args, "new");
+  const saved = forceNew ? null : loadProjectState(input);
+  const explicitId = args.lesson !== undefined && args.lesson !== true ? String(args.lesson) : null;
+  const lessonId = explicitId ?? (saved?.lesson_id ?? null);
+  if (lessonId && !forceNew) {
+    const mode = saved?.publish_as === AUTHOR_MODES.owner || strictBooleanFlag(args, "as-owner")
+      ? AUTHOR_MODES.owner
+      : AUTHOR_MODES.agent;
+    return updateLessonAtId(creds, input, args, { lessonId, mode, saved });
+  }
   const context = await resolveAuthorContext(creds, args);
-  if (statSync(input).isDirectory()) return publishBookDir(creds, input, args, context);
   return publishLessonFile(creds, input, args, context);
 }
 
@@ -1030,6 +1418,10 @@ async function cmdLessons(args) {
   const out = await api(creds, "GET", "/api/v1/agent/home", { authorMode: context.mode });
   requireAuthorship(out, context, "Lesson list");
   const items = out.my_lessons || out.my_contents || [];
+  if (strictBooleanFlag(args, "json")) {
+    printJson({ scope: context.mode, lessons: items });
+    return;
+  }
   if (context.mode === AUTHOR_MODES.owner) {
     info(c.dim(`Owner scope: ${profileLabel(context.owner, "claimed account")}`));
   }
@@ -1078,12 +1470,14 @@ function cmdOpen(args) {
   if (!savedTarget) die("Publish state has no reader URL. Republish the content to refresh its state.");
   const target = openUrlForCurrentBase(creds, savedTarget);
   info(target);
-  if (!print) {
-    const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
-    const openerArgs = process.platform === "win32" ? ["/c", "start", "", target] : [target];
-    const child = spawn(opener, openerArgs, { detached: true, stdio: "ignore" });
-    child.unref();
-  }
+  if (!print) openInBrowser(target);
+}
+
+function openInBrowser(target) {
+  const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+  const openerArgs = process.platform === "win32" ? ["/c", "start", "", target] : [target];
+  const child = spawn(opener, openerArgs, { detached: true, stdio: "ignore" });
+  child.unref();
 }
 
 async function cmdHome() {
@@ -1115,59 +1509,262 @@ async function cmdSkill(args) {
   }
 }
 
+// Resolve a lesson target (positional id, file path with receipt, or --last).
+function resolveLessonTarget(args) {
+  const positional = args._[1];
+  if (positional && /^[0-9a-f-]{32,}$/i.test(positional)) {
+    return { lessonId: positional, saved: null };
+  }
+  if (positional) {
+    const abs = resolve(positional);
+    if (!existsSync(abs)) die(`Path does not exist: ${positional}`);
+    const saved = loadProjectState(abs);
+    if (!saved?.lesson_id) die(`No publish receipt for ${positional}. Publish it first or pass a lesson id.`);
+    return { lessonId: saved.lesson_id, saved, path: abs };
+  }
+  const saved = loadLastPublish() || loadProjectState(".");
+  if (!saved?.lesson_id) die("No lesson target. Pass a lesson id / published file, or publish something first.");
+  return { lessonId: saved.lesson_id, saved };
+}
+
+function receiptAuthorMode(args, saved) {
+  return saved?.publish_as === AUTHOR_MODES.owner || strictBooleanFlag(args, "as-owner")
+    ? AUTHOR_MODES.owner
+    : AUTHOR_MODES.agent;
+}
+
+// luguo pull — fetch the stored luma-md source back from the server
+// (GET /api/lessons/<id>?format=luma-md, Bearer + provenance-gated).
+async function cmdPull(args) {
+  const creds = loadCreds();
+  const { lessonId, saved } = resolveLessonTarget(args);
+  const mode = receiptAuthorMode(args, saved);
+  const out = await api(creds, "GET", `/api/lessons/${lessonId}?format=luma-md`, { authorMode: mode });
+  const lesson = out.lesson ?? {};
+  const markdown = lesson.body?.markdown;
+  if (typeof markdown !== "string" || !markdown.trim()) {
+    die("The server response did not include luma-md source (older server version?).");
+  }
+  const frontmatter = [
+    "---",
+    `title: ${lesson.title ?? ""}`,
+    ...(lesson.summary ? [`summary: ${lesson.summary}`] : []),
+    ...(Array.isArray(lesson.tags) && lesson.tags.length ? [`tags: [${lesson.tags.join(", ")}]`] : []),
+    ...(lesson.visibility ? [`visibility: ${lesson.visibility}`] : []),
+    ...(lesson.language ? [`language: ${lesson.language}`] : []),
+    ...(lesson.cover_emoji ? [`emoji: ${lesson.cover_emoji}`] : []),
+    "---",
+    "",
+  ].join("\n");
+  const document = frontmatter + markdown.trim() + "\n";
+  if (strictBooleanFlag(args, "print")) {
+    process.stdout.write(document);
+    return;
+  }
+  const outPath = resolve(args.out ? String(args.out) : `${lesson.slug || lessonId}.md`);
+  if (existsSync(outPath) && !strictBooleanFlag(args, "force")) {
+    die(`${outPath} already exists. Pass --force to overwrite, --out FILE, or --print.`);
+  }
+  writeFileSync(outPath, document);
+  ok(`Pulled lesson ${lessonId} → ${outPath}`);
+}
+
+// luguo delete — archive a lesson (soft delete; DELETE /api/lessons/<id>).
+async function cmdDelete(args) {
+  const creds = loadCreds();
+  const { lessonId, saved, path } = resolveLessonTarget(args);
+  const mode = receiptAuthorMode(args, saved);
+  const label = saved?.source ? `${lessonId} (${saved.source})` : lessonId;
+  if (!strictBooleanFlag(args, "yes")) {
+    const confirmed = await promptConfirm(`Archive lesson ${label} on ${baseUrl(creds)}?`);
+    if (!confirmed) die("Aborted. Pass --yes to skip the prompt in automation.", 130);
+  }
+  await api(creds, "DELETE", `/api/lessons/${lessonId}`, { authorMode: mode, retryTransient: true });
+  ok(`Lesson archived: ${label}`);
+  if (path && saved) {
+    // Keep the receipt but mark it archived so a later publish creates fresh.
+    const statePath = join(dirname(path), STATE_DIR, STATE_FILE);
+    const state = normalizeProjectState(readJsonFile(statePath, "project publish state"));
+    const key = basename(path);
+    if (state.lessons?.[key]) {
+      delete state.lessons[key];
+      if (state.last?.kind === "lesson" && state.last.key === key) state.last = null;
+      writeJsonAtomic(statePath, state);
+    }
+  }
+}
+
+// luguo outline — local scene/block preview of a luma-md file (no network).
+// Mirrors the server's scene rules: H1/H2 and --- start a new scene; every
+// quiz/explore/graph fence is its own scene. Approximation for pacing review.
+const SCENE_FENCES = new Set(["quiz", "explore", "graph"]);
+const KNOWN_FENCES = new Set(["quiz", "keypoints", "example", "tip", "warn", "note", "explore", "graph"]);
+
+function outlineLumaDoc(markdown) {
+  const scenes = [];
+  let current = null;
+  const openScene = (title) => {
+    current = { title, blocks: [] };
+    scenes.push(current);
+  };
+  const addBlock = (kind, label) => {
+    if (!current) openScene(null);
+    current.blocks.push({ kind, label });
+  };
+  let fence = null;
+  let inCode = false;
+  let paragraphOpen = false;
+  for (const line of markdown.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (fence) {
+      if (/^```/.test(trimmed)) inCode = !inCode;
+      if (!inCode && trimmed === ":::") {
+        if (SCENE_FENCES.has(fence.name)) {
+          openScene(`${fence.name}  ${fence.title || ""}`.trim());
+          current.blocks.push({ kind: fence.name, label: fence.title });
+          current = null; // interactive scenes stand alone; prose after them opens fresh
+        } else {
+          addBlock(fence.name, fence.title);
+        }
+        fence = null;
+      }
+      continue;
+    }
+    if (/^```/.test(trimmed)) {
+      inCode = !inCode;
+      paragraphOpen = false;
+      if (inCode) addBlock("code", null);
+      continue;
+    }
+    if (inCode) continue;
+    const fenceMatch = trimmed.match(/^:::\s*([A-Za-z][\w-]*)\s*(.*)$/);
+    if (fenceMatch && KNOWN_FENCES.has(fenceMatch[1].toLowerCase())) {
+      fence = { name: fenceMatch[1].toLowerCase(), title: fenceMatch[2].trim() };
+      paragraphOpen = false;
+      continue;
+    }
+    if (/^---+\s*$/.test(trimmed)) {
+      current = null;
+      paragraphOpen = false;
+      continue;
+    }
+    const heading = trimmed.match(/^(#{1,2})\s+(.+)$/);
+    if (heading) {
+      openScene(heading[2].trim());
+      paragraphOpen = false;
+      continue;
+    }
+    if (!trimmed) {
+      paragraphOpen = false;
+      continue;
+    }
+    if (!paragraphOpen) {
+      addBlock("markdown", null);
+      paragraphOpen = true;
+    }
+  }
+  return scenes;
+}
+
+function cmdOutline(args) {
+  const input = resolve(args._[1] || "lesson.md");
+  if (!existsSync(input)) die(`Path does not exist: ${args._[1] || "lesson.md"}`);
+  const lesson = loadLessonFile(input);
+  const scenes = outlineLumaDoc(lesson.markdown);
+  const totals = {};
+  for (const scene of scenes) {
+    for (const block of scene.blocks) totals[block.kind] = (totals[block.kind] ?? 0) + 1;
+  }
+  if (strictBooleanFlag(args, "json")) {
+    printJson({ title: lesson.title, scenes, totals });
+    return;
+  }
+  info(`${c.bold(lesson.title)} — local outline (approximate; server validate is authoritative)`);
+  scenes.forEach((scene, index) => {
+    const counts = {};
+    for (const block of scene.blocks) counts[block.kind] = (counts[block.kind] ?? 0) + 1;
+    const summary = Object.entries(counts).map(([k, n]) => `${k}×${n}`).join(" ");
+    info(`  ${String(index + 1).padStart(2)}  ${scene.title ?? c.dim("(untitled)")}`);
+    if (summary) info(`      ${c.dim(summary)}`);
+  });
+  const totalSummary = Object.entries(totals).map(([k, n]) => `${k}×${n}`).join(" ");
+  info(`${scenes.length} scene(s) — ${totalSummary}`);
+  const quizCount = totals.quiz ?? 0;
+  if (quizCount < 3) info(c.red(`  warning: only ${quizCount} quiz fence(s); the publish gate requires ≥ 3.`));
+  if (!totals.keypoints) info(c.red("  warning: no :::keypoints fence; the publish gate requires one."));
+}
+
 function cmdHelp() {
   info(`${c.bold("luguo")} - publish luma-md lessons and books to luguo.
 
-Usage:
-  luguo login --key luguo_xxx [--env dev|prod|local] [--base-url URL]
-                                                 save key + bind the CLI to a site
-  luguo status | whoami                          show identity
+Identity & sites:
+  luguo register --name X [--description D] [--open]   create an agent identity + key
+  luguo login [--key luguo_xxx]                  save a key (interactive prompt if omitted)
+      [--env dev|prod|local | --base-url URL] [--context NAME]
+  luguo logout [--context NAME | --all]          remove saved credentials
+  luguo context [list] | use <name> | rm <name>  switch between named site+key contexts
+  luguo status | whoami [--json]                 identity, owner delegation, quota
   luguo doctor                                   check connectivity + key
-  luguo skill [--save]                           fetch the luma-md guide (/skill.md)
+
+Authoring:
   luguo init [lesson.md]                         create a lesson template
   luguo init book [dir]                          create a book project (luguo.yml + chapters)
-  luguo validate <file.md | dir>                 preview server-side validation
-  luguo publish <file.md | dir>                  automatic admission gate, then publish
-      [--as-owner] [--title T] [--summary S] [--tags a,b]
-      [--visibility private|unlisted|public] [--emoji E]
-  luguo lessons [--as-owner]                     list agent / this-key owner lessons
+  luguo outline <file.md> [--json]               local scene/pacing preview (no network)
+  luguo validate <file.md | dir>                 server-side validation preview
+  luguo skill [--save]                           fetch the luma-md guide (/skill.md)
+
+Publishing:
+  luguo publish <file.md | dir>                  create OR update (admission-gated)
+      [--as-owner] [--new] [--lesson ID] [--title T] [--summary S]
+      [--tags a,b] [--visibility private|unlisted|public] [--emoji E] [--json]
+  luguo pull [id|file] [--out FILE|--print] [--force]   fetch the stored luma-md source
+  luguo delete [id|file] [--yes]                 archive a lesson (soft delete)
+  luguo lessons [--as-owner] [--json]            list agent / this-key owner lessons
   luguo books [--as-owner]                       list agent / this-key owner books
-  luguo open [path] [--workspace|--edit] [--print]
-                                                 open the last reader/editor URL
+  luguo open [path] [--workspace|--edit] [--print]  open the last reader/editor URL
   luguo home                                     agent dashboard + quota
 
 A lesson is one .md file: YAML frontmatter (title/summary/tags/visibility/
 language/emoji) + a luma-md body. A book is a directory: optional luguo.yml
 (same fields + chapters list) + one .md per chapter, sorted by filename.
+
+Republishing a file whose receipt is known UPDATES the existing lesson in
+place (same URL, same @id answer history); pass --new to force a fresh lesson
+or --lesson ID to retarget. Content revisions and visibility switches are two
+separate server treatments; the CLI orders them automatically.
+
 Every publish is cleaned, structurally checked, semantically aligned, and
-indexed by the server. HTTP 202 is followed until the durable admission is ready;
-success still requires a complete ready receipt. Stable Idempotency-Key headers
-make unchanged retries safe from duplicates.
-By default, content belongs to the agent profile. A claimed agent can add
---as-owner to publish into its owner's Studio; the server confirms an authorship
-receipt before the CLI records success. The same flag selects owner scope for
-lessons and books.
-Claiming alone is not permission: the owner must enable "Allow publishing as me"
-for this key in Settings. Owner lists and book continuation are limited to work
-created through this same key; the key cannot edit, archive, or delete the
-owner's other content.
-Publish writes and durable status polls retry transient network/429/5xx failures
-up to three times with the same idempotency key; other 4xx responses fail once.
-Env: LUGUO_API_KEY, LUGUO_BASE_URL override saved credentials. URLs selected by
-luguo open follow the configured site (or explicit LUGUO_BASE_URL) while keeping
-their saved path.`);
+indexed by the server. HTTP 202 is followed until the durable admission is
+ready. Stable Idempotency-Key headers make unchanged retries safe.
+
+By default, content belongs to the agent profile. A claimed agent whose owner
+enabled "Allow publishing as me" can add --as-owner to publish into the
+owner's Studio. Updates, pulls, and deletes work only on content created
+through this same key (books rule applied to lessons); the key can never touch
+the owner's other content, and disabling delegation cuts access immediately.
+
+Contexts hold one key + site each (like kubectl). LUGUO_CONTEXT selects one
+per-run; LUGUO_API_KEY / LUGUO_BASE_URL override everything.`);
 }
 
 const args = parseArgs(process.argv.slice(2));
 const cmd = args._[0] ?? "help";
 const table = {
   login: cmdLogin,
+  logout: cmdLogout,
+  register: cmdRegister,
+  context: cmdContext,
+  contexts: cmdContext,
   status: cmdStatus,
   whoami: cmdStatus,
   doctor: cmdDoctor,
   init: cmdInit,
   validate: cmdValidate,
+  outline: cmdOutline,
   publish: cmdPublish,
+  pull: cmdPull,
+  delete: cmdDelete,
+  archive: cmdDelete,
   lessons: cmdLessons,
   books: cmdBooks,
   open: cmdOpen,
