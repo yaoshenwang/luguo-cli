@@ -197,10 +197,13 @@ test("init creates an admission-ready structural template", async () => {
     assert.equal(out.code, 0);
     const markdown = await readFile(lessonPath, "utf8");
     assert.equal((markdown.match(/^:::quiz\b/gm) || []).length, 3);
-    assert.equal((markdown.match(/^@id\s+/gm) || []).length, 3);
+    // 3 quiz ids + 1 explore id (the :::explore sample ships with the template)
+    assert.equal((markdown.match(/^@id\s+/gm) || []).length, 4);
     assert.equal((markdown.match(/^@skills\s+/gm) || []).length, 3);
     assert.equal((markdown.match(/^@steps\s+/gm) || []).length, 3);
     assert.match(markdown, /^:::keypoints\b/m);
+    assert.match(markdown, /^:::example\b/m);
+    assert.match(markdown, /"domain": \[-8, 8\]/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -439,48 +442,59 @@ test("ordinary validation does not use publish-only transient retries", async ()
   }
 });
 
-test("lesson publish requires 201 ready, persists admission, and reuses a stable idempotency key", async () => {
+test("lesson publish requires 201 ready, persists admission, and republish updates in place", async () => {
   const { root, home } = await tempProject();
   const lessonPath = join(root, "lesson.md");
   await writeFile(lessonPath, LESSON);
-  const keys = [];
+  const creates = [];
+  const updates = [];
   try {
     await withMock(async (req, res) => {
-      assert.equal(req.method, "POST");
-      assert.equal(req.url, "/api/agent/lessons");
-      keys.push(req.headers["idempotency-key"]);
-      const body = await readJsonBody(req);
-      assert.equal(body.body.format, "luma-md-v1");
-      assert.match(body.body.markdown, /q-mock-1/);
-      sendJson(res, 201, {
-        lesson: { id: "lesson_test_1", slug: "mock-admission", url: "/lessons/mock-admission" },
-        admission: READY_ADMISSION,
-        blocks: 2,
-        scenes: 1,
-        block_counts: { heading: 1, quiz: 1 },
-      });
+      if (req.method === "POST" && req.url === "/api/agent/lessons") {
+        creates.push(req.headers["idempotency-key"]);
+        const body = await readJsonBody(req);
+        assert.equal(body.body.format, "luma-md-v1");
+        assert.match(body.body.markdown, /q-mock-1/);
+        sendJson(res, 201, {
+          lesson: { id: "lesson_test_1", slug: "mock-admission", url: "/lessons/mock-admission" },
+          admission: READY_ADMISSION,
+          blocks: 2,
+          scenes: 1,
+          block_counts: { heading: 1, quiz: 1 },
+        });
+        return;
+      }
+      // A source file with a v2 receipt republishes as an in-place update: the
+      // lesson URL and @id answer history survive instead of duplicating.
+      if (req.method === "PATCH" && req.url === "/api/lessons/lesson_test_1") {
+        updates.push(req.headers["idempotency-key"]);
+        const body = await readJsonBody(req);
+        assert.equal(body.body.format, "luma-md-v1");
+        sendJson(res, 200, {
+          lesson: { id: "lesson_test_1", slug: "mock-admission", url: "/lessons/mock-admission" },
+        });
+        return;
+      }
+      sendJson(res, 404, { error: "Not found" });
     }, async (baseUrl) => {
       const first = await runCli(["publish", lessonPath], { cwd: root, home, baseUrl });
       const second = await runCli(["publish", lessonPath], { cwd: root, home, baseUrl });
       const changed = await runCli(["publish", lessonPath, "--title", "Changed title"], { cwd: root, home, baseUrl });
-      const otherAgent = await runCli(["publish", lessonPath], {
-        cwd: root,
-        home,
-        baseUrl,
-        key: "luguo_other_test_placeholder_not_a_secret",
-      });
-      assert.equal(first.code, 0);
-      assert.equal(second.code, 0);
-      assert.equal(changed.code, 0);
-      assert.equal(otherAgent.code, 0);
+      const forcedNew = await runCli(["publish", lessonPath, "--new"], { cwd: root, home, baseUrl });
+      assert.equal(first.code, 0, first.stderr);
+      assert.equal(second.code, 0, second.stderr);
+      assert.equal(changed.code, 0, changed.stderr);
+      assert.equal(forcedNew.code, 0, forcedNew.stderr);
       assert.match(first.stdout, /gate\s+luma-admission-v2 \(ready, 0 repair\(s\)\)/);
       assert.match(first.stdout, /teaches×2.*bindings×3/);
+      assert.match(second.stdout, /Lesson updated/);
     });
-    assert.equal(keys.length, 4);
-    assert.match(keys[0], /^luguo-cli-v1-[a-f0-9]{64}$/);
-    assert.equal(keys[0], keys[1]);
-    assert.notEqual(keys[0], keys[2]);
-    assert.notEqual(keys[0], keys[3]);
+    assert.equal(creates.length, 2); // first publish + --new
+    assert.equal(updates.length, 2); // unchanged republish + --title change
+    assert.match(creates[0], /^luguo-cli-v1-[a-f0-9]{64}$/);
+    assert.equal(creates[0], creates[1]); // same payload → same create intent key
+    assert.match(updates[0], /^luguo-cli-v1-[a-f0-9]{64}$/);
+    assert.notEqual(updates[0], updates[1]); // changed title → new update intent
     const state = JSON.parse(await readFile(join(root, ".luguo", "state.json"), "utf8"));
     assert.equal(state.version, 2);
     assert.deepEqual(state.lessons["lesson.md"].admission, READY_ADMISSION);
@@ -588,12 +602,24 @@ test("claimed owner publish is scoped, idempotent, verified, and opens the human
       if (req.method === "POST" && req.url === "/api/agent/lessons") {
         const mode = req.headers["x-luguo-act-as"] === "owner" ? "owner" : "agent";
         const body = await readJsonBody(req);
-        requests.push({ mode, body, key: req.headers["idempotency-key"] });
+        requests.push({ method: "POST", mode, body, key: req.headers["idempotency-key"] });
         const id = mode === "owner" ? "lesson_owner_1" : "lesson_agent_1";
         sendJson(res, 201, {
           lesson: { id, slug: `${mode}-lesson`, url: `/lessons/${mode}-lesson` },
           admission: READY_ADMISSION,
           ...(mode === "owner" ? { authorship: OWNER_AUTHORSHIP } : {}),
+        });
+        return;
+      }
+      // Owner-published lessons stay manageable through the same key: the
+      // republish arrives as a delegated PATCH instead of a duplicate create.
+      if (req.method === "PATCH" && req.url === "/api/lessons/lesson_owner_1") {
+        const mode = req.headers["x-luguo-act-as"] === "owner" ? "owner" : "agent";
+        const body = await readJsonBody(req);
+        requests.push({ method: "PATCH", mode, body, key: req.headers["idempotency-key"] });
+        sendJson(res, 200, {
+          lesson: { id: "lesson_owner_1", slug: "owner-lesson", url: "/lessons/owner-lesson" },
+          authorship: OWNER_AUTHORSHIP,
         });
         return;
       }
@@ -603,6 +629,7 @@ test("claimed owner publish is scoped, idempotent, verified, and opens the human
       const second = await runCli(["publish", "--as-owner", lessonPath], { cwd: root, home, baseUrl });
       assert.equal(first.code, 0, first.stderr);
       assert.equal(second.code, 0, second.stderr);
+      assert.match(second.stdout, /Lesson updated/);
       assert.match(first.stdout, /author\s+@mock-owner \(via @mock-agent\)/);
       assert.match(first.stdout, new RegExp(`${baseUrl}/lessons/lesson_owner_1/edit`));
 
@@ -627,18 +654,28 @@ test("claimed owner publish is scoped, idempotent, verified, and opens the human
       assert.equal(rebased.code, 0, rebased.stderr);
       assert.equal(rebased.stdout.trim(), "https://dev.example/lessons/lesson_owner_1/edit");
 
-      const agent = await runCli(["publish", lessonPath], { cwd: root, home, baseUrl });
+      // A plain republish keeps the lesson's recorded owner authorship and
+      // updates in place; --new is the explicit way to mint a fresh agent-mode
+      // lesson from the same source file.
+      const ownerUpdateNoFlag = await runCli(["publish", lessonPath], { cwd: root, home, baseUrl });
+      assert.equal(ownerUpdateNoFlag.code, 0, ownerUpdateNoFlag.stderr);
+      const agent = await runCli(["publish", lessonPath, "--new"], { cwd: root, home, baseUrl });
       assert.equal(agent.code, 0, agent.stderr);
 
-      assert.equal(requests.length, 3);
+      assert.equal(requests.length, 4);
+      assert.equal(requests[0].method, "POST");
       assert.equal(requests[0].mode, "owner");
+      assert.equal(requests[1].method, "PATCH");
       assert.equal(requests[1].mode, "owner");
-      assert.equal(requests[2].mode, "agent");
-      assert.equal(requests[0].key, requests[1].key);
-      assert.notEqual(requests[0].key, requests[2].key);
+      assert.equal(requests[2].method, "PATCH");
+      assert.equal(requests[2].mode, "owner");
+      assert.equal(requests[3].method, "POST");
+      assert.equal(requests[3].mode, "agent");
+      assert.equal(requests[1].key, requests[2].key); // unchanged update intent is idempotent
+      assert.notEqual(requests[0].key, requests[3].key);
       assert.equal(
-        requests[2].key,
-        legacyIdempotencyKey(baseUrl, "POST", "/api/agent/lessons", requests[2].body),
+        requests[3].key,
+        legacyIdempotencyKey(baseUrl, "POST", "/api/agent/lessons", requests[3].body),
       );
     });
   } finally {

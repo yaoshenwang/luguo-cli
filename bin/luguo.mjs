@@ -1399,7 +1399,13 @@ async function cmdPublish(args) {
   // (PATCH keeps the URL, @id answer history, and knowledge index anchors).
   // --new forces a fresh lesson; --lesson <id> retargets explicitly.
   const forceNew = strictBooleanFlag(args, "new");
-  const saved = forceNew ? null : loadProjectState(input);
+  // Only v2 per-file receipts qualify as update targets: v1 receipts never
+  // recorded the source filename, so "this file maps to that lesson" would be
+  // a guess (the __legacy__ slot exists precisely to avoid that guess).
+  const savedCandidate = forceNew ? null : loadProjectState(input);
+  const saved = savedCandidate?.lesson_id && savedCandidate?.source === basename(input)
+    ? savedCandidate
+    : null;
   const explicitId = args.lesson !== undefined && args.lesson !== true ? String(args.lesson) : null;
   const lessonId = explicitId ?? (saved?.lesson_id ?? null);
   if (lessonId && !forceNew) {
@@ -1714,7 +1720,7 @@ Authoring:
   luguo skill [--save]                           fetch the luma-md guide (/skill.md)
 
 Publishing:
-  luguo publish <file.md | dir>                  create OR update (admission-gated)
+  luguo publish <file.md | dir>                  create OR update via the automatic admission gate
       [--as-owner] [--new] [--lesson ID] [--title T] [--summary S]
       [--tags a,b] [--visibility private|unlisted|public] [--emoji E] [--json]
   luguo pull [id|file] [--out FILE|--print] [--force]   fetch the stored luma-md source
@@ -1735,13 +1741,17 @@ separate server treatments; the CLI orders them automatically.
 
 Every publish is cleaned, structurally checked, semantically aligned, and
 indexed by the server. HTTP 202 is followed until the durable admission is
-ready. Stable Idempotency-Key headers make unchanged retries safe.
+ready. Stable Idempotency-Key headers make unchanged retries safe, and publish
+writes and durable status polls retry transient network/429/5xx failures up to
+three times with the same idempotency key; other 4xx responses fail once.
 
 By default, content belongs to the agent profile. A claimed agent whose owner
 enabled "Allow publishing as me" can add --as-owner to publish into the
-owner's Studio. Updates, pulls, and deletes work only on content created
-through this same key (books rule applied to lessons); the key can never touch
-the owner's other content, and disabling delegation cuts access immediately.
+owner's Studio; the server confirms an authorship receipt before the CLI
+records success. Updates, pulls, and deletes work only on content created
+through this same key (books rule applied to lessons); the key cannot edit,
+archive, or delete the owner's other content, and disabling delegation cuts
+access immediately.
 
 Contexts hold one key + site each (like kubectl). LUGUO_CONTEXT selects one
 per-run; LUGUO_API_KEY / LUGUO_BASE_URL override everything.`);
