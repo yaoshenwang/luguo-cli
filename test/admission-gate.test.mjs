@@ -112,14 +112,16 @@ function legacyIdempotencyKey(baseUrl, method, path, body, key = TEST_KEY) {
 
 function runCli(args, { cwd, home, baseUrl, key = TEST_KEY } = {}) {
   return new Promise((resolveRun) => {
+    const env = {
+      ...process.env,
+      HOME: home,
+      LUGUO_API_KEY: key,
+    };
+    if (baseUrl === undefined) delete env.LUGUO_BASE_URL;
+    else env.LUGUO_BASE_URL = baseUrl;
     execFile(process.execPath, [CLI, ...args], {
       cwd: cwd || REPO_ROOT,
-      env: {
-        ...process.env,
-        HOME: home,
-        LUGUO_BASE_URL: baseUrl,
-        LUGUO_API_KEY: key,
-      },
+      env,
       maxBuffer: 1024 * 1024,
     }, (error, stdout, stderr) => {
       resolveRun({
@@ -616,6 +618,15 @@ test("claimed owner publish is scoped, idempotent, verified, and opens the human
       assert.equal(opened.code, 0, opened.stderr);
       assert.equal(opened.stdout.trim(), ownerReceipt.workspace_url);
 
+      const rebased = await runCli(["open", "--workspace", lessonPath, "--print"], {
+        cwd: root,
+        home,
+        baseUrl: "https://dev.example",
+        key: "",
+      });
+      assert.equal(rebased.code, 0, rebased.stderr);
+      assert.equal(rebased.stdout.trim(), "https://dev.example/lessons/lesson_owner_1/edit");
+
       const agent = await runCli(["publish", lessonPath], { cwd: root, home, baseUrl });
       assert.equal(agent.code, 0, agent.stderr);
 
@@ -907,6 +918,15 @@ test("state v2 preserves sibling lessons, global last works, and legacy state re
       assert.equal(noWorkspace.code, 1);
       assert.match(noWorkspace.stderr, /has no human workspace URL/);
 
+      const rebasedLatest = await runCli(["open", "--print"], {
+        cwd: root,
+        home,
+        baseUrl: "https://dev.example",
+        key: "",
+      });
+      assert.equal(rebasedLatest.code, 0, rebasedLatest.stderr);
+      assert.equal(rebasedLatest.stdout.trim(), "https://dev.example/lessons/second");
+
       const badFlag = await runCli(["publish", firstPath, "--as-owner=true"], { cwd: root, home, baseUrl });
       assert.equal(badFlag.code, 1);
       assert.match(badFlag.stderr, /--as-owner does not take a value/);
@@ -928,7 +948,6 @@ test("state v2 preserves sibling lessons, global last works, and legacy state re
     const legacy = await runCli(["open", legacyLesson, "--print"], {
       cwd: legacyRoot,
       home,
-      baseUrl: "http://127.0.0.1:1",
       key: "",
     });
     assert.equal(legacy.code, 0, legacy.stderr);

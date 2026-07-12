@@ -119,6 +119,16 @@ function absoluteUrl(creds, path) {
   return `${baseUrl(creds)}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
+function openUrlForCurrentBase(creds, target) {
+  if (!process.env.LUGUO_BASE_URL?.trim()) return target;
+  try {
+    const saved = new URL(target);
+    return `${baseUrl(creds)}${saved.pathname}${saved.search}${saved.hash}`;
+  } catch {
+    return absoluteUrl(creds, target);
+  }
+}
+
 function requireKey(creds) {
   const key = process.env.LUGUO_API_KEY || creds?.api_key;
   if (!key) die(`Not logged in. Create an agent key in ${baseUrl(creds)}/settings, then run \`luguo login --key luguo_xxx\`.`);
@@ -1051,6 +1061,7 @@ async function cmdBooks(args) {
 }
 
 function cmdOpen(args) {
+  const creds = loadCreds();
   const explicit = args._[1];
   if (explicit && !existsSync(resolve(explicit))) die(`Path does not exist: ${explicit}`);
   const state = explicit ? loadProjectState(explicit) : loadLastPublish() || loadProjectState(".");
@@ -1059,11 +1070,12 @@ function cmdOpen(args) {
   const edit = strictBooleanFlag(args, "edit");
   const print = strictBooleanFlag(args, "print");
   const wantWorkspace = workspace || edit;
-  const target = wantWorkspace ? state.workspace_url : state.reader_url || state.url;
-  if (!target && wantWorkspace) {
+  const savedTarget = wantWorkspace ? state.workspace_url : state.reader_url || state.url;
+  if (!savedTarget && wantWorkspace) {
     die("This publish has no human workspace URL. Use --as-owner when publishing, then retry `luguo open --workspace`.");
   }
-  if (!target) die("Publish state has no reader URL. Republish the content to refresh its state.");
+  if (!savedTarget) die("Publish state has no reader URL. Republish the content to refresh its state.");
+  const target = openUrlForCurrentBase(creds, savedTarget);
   info(target);
   if (!print) {
     const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
@@ -1140,7 +1152,8 @@ created through this same key; the key cannot edit, archive, or delete the
 owner's other content.
 Publish writes and durable status polls retry transient network/429/5xx failures
 up to three times with the same idempotency key; other 4xx responses fail once.
-Env: LUGUO_API_KEY, LUGUO_BASE_URL override saved credentials.`);
+Env: LUGUO_API_KEY, LUGUO_BASE_URL override saved credentials. An explicit
+LUGUO_BASE_URL also rebases URLs selected by luguo open to that site.`);
 }
 
 const args = parseArgs(process.argv.slice(2));

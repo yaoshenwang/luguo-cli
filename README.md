@@ -244,7 +244,9 @@ Env overrides: `LUGUO_API_KEY`, `LUGUO_BASE_URL` (handy for testing against
 - `~/.config/luguo/last-publish.json` records the most recent successful receipt,
   so plain `luguo open` works even after publishing a book subdirectory. Pass a
   file or directory to select its project receipt; add `--workspace` / `--edit`
-  for the human editor, or `--print` to avoid launching a browser.
+  for the human editor, or `--print` to avoid launching a browser. When
+  `LUGUO_BASE_URL` is explicitly set, `open` keeps the saved path but uses that
+  site's origin (for example, to inspect the same shared-DB lesson on dev).
 - Re-running an unchanged publish is idempotent. Agent and owner modes have
   separate idempotency scopes. Changing content or metadata creates a new
   publish operation.

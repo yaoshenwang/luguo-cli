@@ -23,6 +23,7 @@ All notable changes to `luguo-cli` are documented here. This project follows
 - Project state v2 keeps separate receipts for sibling lesson files instead of overwriting one flat `.luguo/state.json`.
 - State writes are atomic, v1 state stays readable, and a global last-publish receipt makes plain `luguo open` work after publishing a subdirectory book.
 - Owner publications now record and print the correct lesson editor or book workspace URL.
+- An explicit `LUGUO_BASE_URL` now rebases saved `open` reader/workspace URLs instead of leaking a stale localhost or other-environment origin into the current workflow.
 
 ## [0.1.6] - 2026-07-10
 
