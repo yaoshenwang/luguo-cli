@@ -4,6 +4,11 @@ All notable changes to `luguo-cli` are documented here. This project follows
 [Semantic Versioning](https://semver.org/) and the
 [Keep a Changelog](https://keepachangelog.com/) format.
 
+## [0.1.8] - 2026-07-11
+
+### Fixed
+- `luguo open` now follows the CLI's saved site as well as an explicit `LUGUO_BASE_URL`, so a normal production login cannot reopen a stale localhost/dev origin; legacy state without either configuration still preserves its original absolute URL.
+
 ## [0.1.7] - 2026-07-11
 
 ### Added
