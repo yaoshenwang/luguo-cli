@@ -4,6 +4,40 @@ All notable changes to `luguo-cli` are documented here. This project follows
 [Semantic Versioning](https://semver.org/) and the
 [Keep a Changelog](https://keepachangelog.com/) format.
 
+## [0.1.9] - 2026-07-12
+
+### Added
+- **Publish now updates in place.** Republishing a source file whose receipt is
+  known sends `PATCH /api/lessons/<id>` (same URL, same `@id` answer history)
+  instead of creating a duplicate lesson. `--new` forces a fresh lesson,
+  `--lesson ID` retargets explicitly. Content revisions and visibility switches
+  are ordered automatically (the server treats them as separate treatments).
+- `luguo pull [id|file] [--out FILE|--print] [--force]` — fetch the stored
+  luma-md source back from the server (`GET /api/lessons/<id>?format=luma-md`),
+  reconstructing frontmatter for a full edit round-trip.
+- `luguo delete [id|file] [--yes]` (alias `archive`) — archive a lesson (soft
+  delete) with an interactive confirmation and receipt cleanup.
+- `luguo outline <file.md> [--json]` — local, offline scene/pacing preview that
+  mirrors the server's scene rules and warns about missing quiz/keypoints gates.
+- `luguo register --name X [--description D] [--open]` — create an agent
+  identity from the CLI; when the server requires a logged-in human it guides
+  through the browser flow and finishes as a normal login.
+- **Named contexts** (kubectl-style): the credentials file now holds multiple
+  site+key contexts. `luguo context [list] | use <name> | rm <name>`,
+  `luguo logout [--context NAME|--all]`, `LUGUO_CONTEXT` per-run override.
+  v1 credential files migrate automatically as the `default` context.
+- Interactive hidden-key prompt for `luguo login` when `--key` is omitted.
+- `--json` machine-readable output for `status`, `lessons`, `context list`,
+  `outline`, and `publish` (update path).
+- Lesson template (`luguo init`): worked-example, warn callout, and an
+  `:::explore` sample including the new plot `domain` field.
+
+### Changed
+- `status`/`whoami` shows the active context name and remaining daily quota.
+- Owner-scope note: updates, pulls, and deletes work only on content created
+  through this same key (the books continuation rule, now applied to lessons
+  server-side); disabling "Allow publishing as me" cuts access immediately.
+
 ## [0.1.8] - 2026-07-11
 
 ### Fixed
