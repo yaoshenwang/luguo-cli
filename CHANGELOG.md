@@ -4,6 +4,39 @@ All notable changes to `luguo-cli` are documented here. This project follows
 [Semantic Versioning](https://semver.org/) and the
 [Keep a Changelog](https://keepachangelog.com/) format.
 
+## [0.1.13] - 2026-07-13
+
+### Added
+- `luguo draft login/status/logout` manages a separately pinned human-account
+  cookie session. Passwords are accepted only through a hidden prompt or
+  explicit stdin, never saved, and auth cookies stay in a mode-`0600` user
+  session file instead of project state or command output.
+- `luguo draft save <file.md> [--lesson UUID] [--book UUID]` creates or updates
+  private human-owned drafts without admission: new content follows the strict
+  `POST private book → POST byte-empty chapter → PATCH lesson draft` flow;
+  updates read the current draft first and use revision CAS.
+- `luguo draft pull` round-trips a private draft into luma-md and refreshes the
+  minimal local draft receipt.
+- `luguo draft reset <file.md>` explicitly discards only a local recovery
+  receipt when the user accepts that an unconfirmed private container may have
+  been created remotely.
+- Mock HTTP coverage for endpoint allowlisting, private/empty creation payloads,
+  cross-process idempotent recovery, title/frontmatter round-trips, HTTP `409`
+  fail-closed behavior, host pinning, local receipt minimization, Node 18 cookie
+  fallback, size preflight, and credential non-disclosure.
+
+### Security
+- Human draft requests have a dedicated method/path/payload allowlist. Agent,
+  validate, admission, publish, and ordinary lesson `PATCH` routes are rejected;
+  `draft validate` and `draft publish` are hard errors.
+- Human cookies are pinned to their login origin and are never sent through the
+  existing Bearer-key request helper. Mode-`0600` draft receipts live outside
+  source projects and contain only book/lesson IDs, revision, a content
+  SHA-256, and a resumable mutation UUID.
+- An unconfirmed container mutation is bound to the exact creation fingerprint
+  and target book. Content/book changes fail locally until explicit reset;
+  replayed chapters are verified against their private parent before CAS write.
+
 ## [0.1.12] - 2026-07-13
 
 ### Added
@@ -182,6 +215,7 @@ First public release.
 - Zero runtime dependencies (pure Node ≥ 18, using the global `fetch` and `node:` builtins).
 - Credentials stored at `~/.config/luguo/credentials.json` with `0600` permissions.
 
+[0.1.13]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.12...v0.1.13
 [0.1.7]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.4...v0.1.5

@@ -1,13 +1,13 @@
 # luguo-cli
 
-把 **luma-md** 课程与书籍发布到 [炉果](https://luguo.ai)。luma-md 是标准
-Markdown 加几个 `:::` 教学围栏（`quiz` / `keypoints` / `example` /
-`tip|warn|note` / `explore` / `graph`）——运行 `luguo skill` 可从服务端拉取
-完整格式指南。
+用本人账号创作私密草稿，或把 **luma-md** 课程与书籍发布到
+[炉果](https://luguo.ai)。luma-md 是标准 Markdown 加几个 `:::` 教学围栏
+（`quiz` / `keypoints` / `example` / `tip|warn|note` / `explore` /
+`graph`）——运行 `luguo skill` 可从服务端拉取完整格式指南。
 
-每节课和每个非空书籍章节变为 ready 前，都会经过炉果统一的自动入库门禁：
-服务端清洗、结构检查、语义对齐和学习图谱索引。CLI 零运行时依赖，要求
-Node.js 18+。
+通过发布命令提交的每节课和每个非空书籍章节，在变为 ready 前都会经过炉果
+统一的自动入库门禁：服务端清洗、结构检查、语义对齐和学习图谱索引。下文独立
+的本人草稿通路永不发布。CLI 零运行时依赖，要求 Node.js 18+。
 
 远程或相对路径的 Markdown/HTML 图片会在入库清洗和语义审查前转换为描述性的
 alt 文本占位。请写清楚 alt 文本，或改用普通正文、`:::explore` 互动，而不要依赖
@@ -29,6 +29,61 @@ npm i -g luguo-cli
 ```bash
 npx luguo-cli@latest help
 ```
+
+## 本人账号私密草稿（不走 admission）
+
+当内容必须由本人真实账号直接写入，而且不能经过 agent 身份、服务端 validate、
+admission 门禁或任何模型通路时，使用独立的 `draft` 命名空间：
+
+```bash
+# 交互式隐藏密码输入；密码不会保存，也不会打印。
+luguo draft login --email you@example.com
+
+# 核对当前真实用户和绑定站点。
+luguo draft status
+
+# 新建一本 private 书 + 空章节，然后只保存 lesson 草稿。
+luguo draft save lesson.md
+
+# 也可以在已有 private 书里新建一个私密草稿章节。
+luguo draft save lesson.md --book 11111111-1111-4111-8111-111111111111
+
+# 或更新一个明确指定的 private lesson（先 GET 草稿，再按 revision 做 CAS）。
+luguo draft save lesson.md --lesson 22222222-2222-4222-8222-222222222222
+
+# 冲突处理前把远端私密草稿拉回本地。
+luguo draft pull lesson.md --lesson 22222222-2222-4222-8222-222222222222 --force
+
+# 明确丢弃本地恢复回执（远端可能留下一个孤立的 private 容器）。
+luguo draft reset lesson.md --yes
+```
+
+非交互场景可让密码管理器把密码管道输入 `--password-stdin`；CLI 故意拒绝
+`--password`，避免密码落进 shell history。`--env dev|prod|local`、
+`--base-url` 和 `--context` 可创建与站点严格绑定的本人会话。Auth cookie 只保存在
+`~/.config/luguo/human-sessions.json`（权限 `0600`），不会打印，也不会进入项目
+state。`draft logout` 只移除当前本地会话，`draft logout --all` 移除全部本人会话。
+
+写入路径被刻意收窄，并且可以沿源码审计：
+
+1. 新容器只允许 `POST /api/books`，且 `visibility: private`。
+2. 章节只允许 `POST /api/books/<id>/chapters`，`markdown` 必须严格等于空串
+   `""`。空章节只建立 private graph，不会进入 admission。
+3. 非空 luma-md 只能通过带 revision CAS 的
+   `PATCH /api/lessons/<id>/draft` 写入。
+4. 更新既有目标时必须先读草稿，并确认 lesson 与父级 book 仍是 private。
+   HTTP `409` 立即停止；瞬态重试复用同一个 mutation UUID 和完全相同的 payload。
+5. 新 lesson ID 尚未确认时，恢复回执会把 UUID 与创建元数据/内容指纹、目标 book
+   严格绑定。更改任一项都会在零请求下本地拒绝，除非明确执行 `draft reset`。
+
+本人 cookie 请求层使用严格的 method/path/payload allowlist，无法访问
+`/api/agent/*`、validate、admission、publish 或普通 lesson `PATCH`；
+`luguo draft validate` 与 `luguo draft publish` 会直接报错。这里会忽略 frontmatter
+里的 visibility，容器始终保持 private。权限为 `0600` 的回执位于所有项目之外的
+`~/.config/luguo/drafts/*.json`，只保存 book/lesson ID、CAS revision、内容指纹
+SHA-256 和可恢复的 mutation UUID；绝不保存源文件路径/原文、标题、邮箱、密码或
+cookie。`draft pull` 覆盖前会比较完整生成文档（包括 frontmatter），因此只改标题也
+属于冲突，除非明确传入 `--force`。
 
 ## 快速开始——发一节课
 

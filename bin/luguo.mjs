@@ -1,11 +1,13 @@
 #!/usr/bin/env node
-// luguo-cli - publish luma-md lessons and books to luguo.
+// luguo-cli - author private drafts or publish luma-md lessons/books to luguo.
 // luma-md is the only content format: plain Markdown plus ::: teaching fences.
 // A single .md file publishes as one lesson (POST /api/agent/lessons);
 // a directory of .md chapters publishes as one book (POST /api/books + chapters).
+// Human-account drafts use a separate cookie session and strict private-only
+// allowlist; they never enter agent validation, admission, or publication.
 
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -21,15 +23,20 @@ import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } 
 
 const CRED_PATH = join(homedir(), ".config", "luguo", "credentials.json");
 const LAST_PUBLISH_PATH = join(homedir(), ".config", "luguo", "last-publish.json");
+const HUMAN_SESSION_PATH = join(homedir(), ".config", "luguo", "human-sessions.json");
+const HUMAN_DRAFT_STATE_DIR = join(homedir(), ".config", "luguo", "drafts");
 const DEFAULT_BASE = "https://luguo.ai";
 const STATE_DIR = ".luguo";
 const STATE_FILE = "state.json";
 const STATE_VERSION = 2;
+const DRAFT_STATE_VERSION = 1;
+const HUMAN_SESSION_VERSION = 1;
+const DRAFT_MARKDOWN_MAX_CHARS = 1_500_000;
 const VISIBILITIES = ["private", "public", "unlisted"];
 const AUTHOR_MODES = { agent: "agent", owner: "owner" };
 const BOOLEAN_FLAGS = new Set([
   "as-owner", "workspace", "edit", "print", "save",
-  "json", "open", "force", "yes", "all", "new", "help",
+  "json", "open", "force", "yes", "all", "new", "help", "password-stdin",
 ]);
 const CRED_VERSION = 2;
 const TRANSIENT_MAX_RETRIES = 3;
@@ -165,10 +172,357 @@ function contextNameFor(args, base) {
     const host = new URL(base).hostname;
     if (host === "luguo.ai") return "prod";
     if (host === "dev.luguo.ai") return "dev";
-    if (host === "localhost" || host === "127.0.0.1") return "local";
+    if (host === "localhost" || host === "127.0.0.1" || host === "[::1]") return "local";
     return host;
   } catch {
     return "default";
+  }
+}
+
+function parseHumanBase(value) {
+  try {
+    const url = new URL(String(value));
+    if (!['https:', 'http:'].includes(url.protocol)) return null;
+    if (url.username || url.password || url.search || url.hash) return null;
+    if (url.pathname && url.pathname !== '/') return null;
+    if (
+      url.protocol !== 'https:' &&
+      !['localhost', '127.0.0.1', '::1', '[::1]'].includes(url.hostname)
+    ) return null;
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return null;
+  }
+}
+
+function requireHumanBase(value) {
+  const base = parseHumanBase(value);
+  if (!base) {
+    die('Human draft sessions require an HTTPS site root (HTTP is allowed only for localhost).');
+  }
+  return base;
+}
+
+function isSupabaseAuthCookieName(name) {
+  return name === 'supabase-auth-token' || (name.startsWith('sb-') && name.includes('auth-token'));
+}
+
+function isHumanContextName(name) {
+  return /^[A-Za-z0-9._-]{1,64}$/.test(String(name));
+}
+
+function requireHumanContextName(name) {
+  if (!isHumanContextName(name)) die('Human draft context names use only letters, digits, dot, underscore, or dash.');
+  return String(name);
+}
+
+function normalizeHumanCookies(raw) {
+  const cookies = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return cookies;
+  for (const [name, value] of Object.entries(raw)) {
+    if (
+      isSupabaseAuthCookieName(name) &&
+      typeof value === 'string' && value &&
+      !/[\r\n;]/.test(value)
+    ) cookies[name] = value;
+  }
+  return cookies;
+}
+
+function normalizeHumanSessionStore(raw) {
+  const contexts = Object.create(null);
+  if (raw?.version === HUMAN_SESSION_VERSION && raw.contexts && typeof raw.contexts === 'object' && !Array.isArray(raw.contexts)) {
+    for (const [name, ctx] of Object.entries(raw.contexts)) {
+      if (!isHumanContextName(name) || !ctx || typeof ctx !== 'object' || Array.isArray(ctx)) continue;
+      const base = parseHumanBase(ctx.base_url);
+      const cookies = normalizeHumanCookies(ctx.cookies);
+      if (base && Object.keys(cookies).length > 0) contexts[name] = { base_url: base, cookies };
+    }
+  }
+  const current = typeof raw?.current === 'string' && contexts[raw.current]
+    ? raw.current
+    : Object.keys(contexts)[0] ?? null;
+  return { version: HUMAN_SESSION_VERSION, current, contexts };
+}
+
+function loadHumanSessionStore() {
+  if (!existsSync(HUMAN_SESSION_PATH)) return normalizeHumanSessionStore(null);
+  try {
+    return normalizeHumanSessionStore(JSON.parse(readFileSync(HUMAN_SESSION_PATH, 'utf8')));
+  } catch {
+    return normalizeHumanSessionStore(null);
+  }
+}
+
+function saveHumanSessionStore(store) {
+  writeJsonAtomic(HUMAN_SESSION_PATH, normalizeHumanSessionStore(store));
+}
+
+function explicitHumanBase(args) {
+  if (args.env && args['base-url']) die('Use either --env or --base-url, not both.');
+  if (args.env) {
+    const value = ENVS[String(args.env).toLowerCase()];
+    if (!value) die(`Unknown --env "${args.env}". Use dev, prod, or local.`);
+    return requireHumanBase(value);
+  }
+  if (args['base-url']) return requireHumanBase(args['base-url']);
+  if (process.env.LUGUO_BASE_URL) return requireHumanBase(process.env.LUGUO_BASE_URL);
+  return null;
+}
+
+function saveHumanSession(args, base, cookies) {
+  const normalizedCookies = normalizeHumanCookies(cookies);
+  if (Object.keys(normalizedCookies).length === 0) {
+    die('The login response did not establish a Supabase auth cookie. No session was saved.');
+  }
+  const store = loadHumanSessionStore();
+  const name = requireHumanContextName(contextNameFor(args, base));
+  store.contexts[name] = { base_url: base, cookies: normalizedCookies };
+  store.current = name;
+  saveHumanSessionStore(store);
+  return name;
+}
+
+function loadHumanSession(args) {
+  const store = loadHumanSessionStore();
+  const requestedBase = explicitHumanBase(args);
+  let name = args.context ? requireHumanContextName(args.context) : process.env.LUGUO_DRAFT_CONTEXT;
+  if (name) name = requireHumanContextName(name);
+  if (!name && requestedBase) {
+    name = Object.keys(store.contexts).find((key) => store.contexts[key].base_url === requestedBase);
+  }
+  if (!name) name = store.current;
+  const ctx = name ? store.contexts[name] : null;
+  if (!name || !ctx) {
+    die('No human draft session. Run `luguo draft login --email you@example.com`.');
+  }
+  if (requestedBase && requestedBase !== ctx.base_url) {
+    die(`Human draft context "${name}" is bound to ${ctx.base_url}; refusing to send its cookie to ${requestedBase}.`);
+  }
+  return { store, name, base_url: ctx.base_url, cookies: { ...ctx.cookies }, persisted: true };
+}
+
+function persistHumanSession(session) {
+  if (!session.persisted) return;
+  const cookies = normalizeHumanCookies(session.cookies);
+  if (Object.keys(cookies).length === 0) {
+    delete session.store.contexts[session.name];
+    if (session.store.current === session.name) {
+      session.store.current = Object.keys(session.store.contexts)[0] ?? null;
+    }
+  } else {
+    session.store.contexts[session.name] = { base_url: session.base_url, cookies };
+  }
+  saveHumanSessionStore(session.store);
+}
+
+function splitSetCookieHeader(value) {
+  if (!value) return [];
+  return String(value).split(/,(?=\s*[!#$%&'*+.^_`|~0-9A-Za-z-]+=)/g);
+}
+
+function responseSetCookies(headers) {
+  if (
+    process.env.LUGUO_CLI_FORCE_SET_COOKIE_FALLBACK !== '1' &&
+    typeof headers?.getSetCookie === 'function'
+  ) return headers.getSetCookie();
+  return splitSetCookieHeader(headers?.get?.('set-cookie'));
+}
+
+function applyResponseCookies(session, headers) {
+  let changed = false;
+  for (const line of responseSetCookies(headers)) {
+    const first = String(line).split(';', 1)[0];
+    const equals = first.indexOf('=');
+    if (equals <= 0) continue;
+    const name = first.slice(0, equals).trim();
+    const value = first.slice(equals + 1).trim();
+    if (!isSupabaseAuthCookieName(name)) continue;
+    const expired = /(?:^|;)\s*max-age=0(?:;|$)/i.test(line) ||
+      /(?:^|;)\s*expires=Thu, 01 Jan 1970/i.test(line);
+    if (expired || !value) {
+      if (session.cookies[name] !== undefined) {
+        delete session.cookies[name];
+        changed = true;
+      }
+    } else if (!/[\r\n;]/.test(value) && session.cookies[name] !== value) {
+      session.cookies[name] = value;
+      changed = true;
+    }
+  }
+  if (changed) persistHumanSession(session);
+}
+
+function cookieHeader(cookies) {
+  return Object.entries(normalizeHumanCookies(cookies))
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([name, value]) => `${name}=${value}`)
+    .join('; ');
+}
+
+function redactSensitiveText(value, secrets = []) {
+  let out = String(value || 'Request failed');
+  for (const secret of secrets) {
+    if (typeof secret === 'string' && secret.length >= 3) out = out.split(secret).join('[redacted]');
+  }
+  return out
+    .replace(/\b(?:authorization|cookie|password)\s*[:=]\s*[^\s,;]+/gi, '[redacted]')
+    .replace(/\bsb-[A-Za-z0-9._-]*auth-token[^\s,;]*/gi, '[redacted-cookie]')
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
+    .slice(0, 500);
+}
+
+function safeInlineText(value) {
+  return String(value ?? '').replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').slice(0, 320);
+}
+
+function assertExactObject(value, keys, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    die(`Human draft safety policy refused malformed ${label}.`);
+  }
+  const want = [...keys].sort();
+  const got = Object.keys(value).sort();
+  if (want.length !== got.length || want.some((key, index) => key !== got[index])) {
+    die(`Human draft safety policy refused unexpected fields in ${label}.`);
+  }
+}
+
+function isUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value));
+}
+
+function requireUuid(value, label) {
+  if (!isUuid(value)) die(`${label} must be a canonical UUID.`);
+  return String(value).toLowerCase();
+}
+
+function assertHumanDraftRequest(method, path, body) {
+  const upper = String(method).toUpperCase();
+  if (typeof path !== 'string' || !path.startsWith('/') || path.startsWith('//')) {
+    die('Human draft safety policy refused a non-relative request URL.');
+  }
+  const parsed = new URL(path, 'https://draft.invalid');
+  if (parsed.search || parsed.hash) die('Human draft safety policy refused query/hash parameters.');
+  const pathname = parsed.pathname;
+  if (/\/api\/agent\/|validate|publish|admission/i.test(pathname)) {
+    die(`Human draft safety policy refused ${upper} ${pathname}.`);
+  }
+
+  if (upper === 'POST' && pathname === '/api/auth/signin') {
+    assertExactObject(body, ['email', 'password'], 'signin payload');
+    if (typeof body.email !== 'string' || !body.email.trim() || typeof body.password !== 'string' || !body.password) {
+      die('Human draft safety policy refused malformed signin credentials.');
+    }
+    return;
+  }
+  if (upper === 'GET' && pathname === '/api/auth/me' && body === undefined) return;
+  if (upper === 'POST' && pathname === '/api/books') {
+    assertExactObject(body, ['cover_emoji', 'language', 'summary', 'tags', 'title', 'visibility'], 'private book payload');
+    if (body.visibility !== 'private') die('Human draft safety policy allows only private books.');
+    if (typeof body.title !== 'string' || !body.title.trim() || !Array.isArray(body.tags)) {
+      die('Human draft safety policy refused malformed private book metadata.');
+    }
+    return;
+  }
+  const book = pathname.match(/^\/api\/books\/([0-9a-f-]+)$/i);
+  if (upper === 'GET' && book && isUuid(book[1]) && body === undefined) return;
+  const chapters = pathname.match(/^\/api\/books\/([0-9a-f-]+)\/chapters$/i);
+  if (upper === 'POST' && chapters && isUuid(chapters[1])) {
+    assertExactObject(body, ['markdown', 'summary', 'title'], 'empty chapter payload');
+    if (body.markdown !== '') die('Human draft safety policy requires a byte-empty chapter markdown body.');
+    if (typeof body.title !== 'string' || !body.title.trim()) {
+      die('Human draft safety policy refused an untitled chapter.');
+    }
+    return;
+  }
+  const draft = pathname.match(/^\/api\/lessons\/([0-9a-f-]+)\/draft$/i);
+  if (upper === 'GET' && draft && isUuid(draft[1]) && body === undefined) return;
+  if (upper === 'PATCH' && draft && isUuid(draft[1])) {
+    assertExactObject(body, ['client_mutation_id', 'expected_revision', 'markdown', 'title'], 'draft CAS payload');
+    if (
+      typeof body.title !== 'string' || !body.title.trim() ||
+      typeof body.markdown !== 'string' ||
+      !Number.isInteger(body.expected_revision) || body.expected_revision < 0 ||
+      !isUuid(body.client_mutation_id)
+    ) die('Human draft safety policy refused malformed draft CAS fields.');
+    return;
+  }
+  const lesson = pathname.match(/^\/api\/lessons\/([0-9a-f-]+)$/i);
+  if (upper === 'GET' && lesson && isUuid(lesson[1]) && body === undefined) return;
+
+  // In particular, ordinary lesson PATCH, publish/admission routes, and all
+  // agent endpoints can never be reached through a human draft cookie.
+  die(`Human draft safety policy refused ${upper} ${pathname}.`);
+}
+
+async function humanRequest(session, method, path, {
+  body,
+  idempotencyKey,
+  allowStatuses = [],
+  retryTransient = false,
+  secrets = [],
+} = {}) {
+  assertHumanDraftRequest(method, path, body);
+  const authenticationRequest = /^\/api\/auth\//.test(path);
+  const headers = { 'user-agent': 'luguo-cli-human-draft' };
+  const cookie = cookieHeader(session.cookies);
+  if (cookie) headers.cookie = cookie;
+  if (body !== undefined) headers['content-type'] = 'application/json';
+  if (idempotencyKey) {
+    if (!isUuid(idempotencyKey)) die('Human draft idempotency keys must be UUIDs.');
+    headers['idempotency-key'] = idempotencyKey;
+  }
+  const requestBody = body === undefined ? undefined : JSON.stringify(body);
+  const protectedSecrets = () => [...secrets, ...Object.values(session.cookies)];
+  let retries = 0;
+  while (true) {
+    let response;
+    try {
+      response = await fetch(`${session.base_url}${path}`, {
+        method,
+        headers,
+        body: requestBody,
+        redirect: 'manual',
+      });
+    } catch (error) {
+      if (retryTransient && retries < TRANSIENT_MAX_RETRIES) {
+        retries += 1;
+        await delay(Math.min(TRANSIENT_RETRY_MAX_MS, TRANSIENT_RETRY_BASE_MS * (2 ** (retries - 1))));
+        continue;
+      }
+      if (authenticationRequest) {
+        die('Human authentication request failed. Check the site and credentials, then try again.');
+      }
+      die(`Human draft request failed: ${redactSensitiveText(error?.message, protectedSecrets())}`);
+    }
+    applyResponseCookies(session, response.headers);
+    const refreshedCookie = cookieHeader(session.cookies);
+    if (refreshedCookie) headers.cookie = refreshedCookie;
+    else delete headers.cookie;
+    const text = await response.text();
+    let json = {};
+    try {
+      json = text ? JSON.parse(text) : {};
+    } catch {
+      json = {};
+    }
+    const transient = response.status === 429 || response.status >= 500;
+    if (!response.ok && retryTransient && transient && retries < TRANSIENT_MAX_RETRIES) {
+      retries += 1;
+      await delay(transientRetryMs(response.headers, retries));
+      continue;
+    }
+    if (!response.ok && allowStatuses.includes(response.status)) {
+      return { status: response.status, json, headers: response.headers };
+    }
+    if (!response.ok || response.status >= 300) {
+      if (authenticationRequest) {
+        die(`Human authentication failed (HTTP ${response.status}). Check credentials and try again.`);
+      }
+      const message = typeof json?.error === 'string' ? json.error : `HTTP ${response.status}`;
+      die(`Human draft request failed (HTTP ${response.status}): ${redactSensitiveText(message, protectedSecrets())}`);
+    }
+    return { status: response.status, json, headers: response.headers };
   }
 }
 
@@ -233,6 +587,15 @@ function promptHidden(question) {
     stdin.setEncoding("utf8");
     stdin.on("data", onData);
   });
+}
+
+async function secretFromStdin() {
+  let value = '';
+  for await (const chunk of process.stdin) {
+    value += String(chunk);
+    if (value.length > 4096) die('Secret input is too long.');
+  }
+  return value.replace(/[\r\n]+$/, '');
 }
 
 // Visible yes/no confirmation. Non-TTY returns false so destructive commands
@@ -538,7 +901,24 @@ function parseScalar(value) {
   if (raw === "true") return true;
   if (raw === "false") return false;
   if (/^-?\d+(\.\d+)?$/.test(raw)) return Number(raw);
+  if (raw.startsWith('"') && raw.endsWith('"')) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (typeof parsed === 'string') return parsed;
+    } catch {
+      // Fall through to the deliberately small YAML compatibility parser.
+    }
+  }
+  if (raw.startsWith("'") && raw.endsWith("'")) {
+    return raw.slice(1, -1).replace(/''/g, "'");
+  }
   if (raw.startsWith("[") && raw.endsWith("]")) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+    } catch {
+      // Preserve support for the existing unquoted `tags: [math, test]` form.
+    }
     return raw
       .slice(1, -1)
       .split(",")
@@ -802,6 +1182,95 @@ function writeJsonAtomic(path, value) {
   } finally {
     if (existsSync(tmp)) unlinkSync(tmp);
   }
+}
+
+function draftContentSha256(title, markdown) {
+  return createHash('sha256')
+    .update(canonicalJson({ title: String(title), markdown: String(markdown) }), 'utf8')
+    .digest('hex');
+}
+
+function draftCreateSha256(lesson) {
+  return createHash('sha256')
+    .update(canonicalJson({
+      title: String(lesson.title),
+      summary: lesson.summary || '',
+      tags: lesson.tags || [],
+      language: lesson.language || 'zh',
+      cover_emoji: lesson.emoji || '📚',
+      markdown: String(lesson.markdown),
+    }), 'utf8')
+    .digest('hex');
+}
+
+function draftStatePath(input, session) {
+  const sourceKey = createHash('sha256')
+    .update(canonicalJson({
+      base_url: session.base_url,
+      context: session.name,
+      source: resolve(input),
+    }), 'utf8')
+    .digest('hex');
+  return join(HUMAN_DRAFT_STATE_DIR, `${sourceKey}.json`);
+}
+
+function normalizeDraftState(raw, { strict = false, path = null } = {}) {
+  const out = { version: DRAFT_STATE_VERSION };
+  if (raw === null || raw === undefined) return out;
+  const invalid = (reason) => {
+    if (strict) {
+      die(`Invalid human draft state${path ? ` at ${path}` : ''}: ${reason}. Run \`luguo draft reset <file.md> --yes\` to discard only the local receipt.`);
+    }
+  };
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || raw.version !== DRAFT_STATE_VERSION) {
+    invalid(`expected version ${DRAFT_STATE_VERSION}`);
+    return out;
+  }
+  const allowed = new Set(['version', 'book_id', 'lesson_id', 'revision', 'content_sha256', 'mutation_uuid']);
+  const unexpected = Object.keys(raw).filter((key) => !allowed.has(key));
+  if (unexpected.length > 0) {
+    invalid(`unexpected field ${unexpected[0]}`);
+    if (strict) return out;
+  }
+  if (raw.book_id !== undefined) {
+    if (!isUuid(raw.book_id)) invalid('book_id is not a UUID');
+    else out.book_id = String(raw.book_id).toLowerCase();
+  }
+  if (raw.lesson_id !== undefined) {
+    if (!isUuid(raw.lesson_id)) invalid('lesson_id is not a UUID');
+    else out.lesson_id = String(raw.lesson_id).toLowerCase();
+  }
+  if (raw.revision !== undefined) {
+    if (!Number.isInteger(raw.revision) || raw.revision < 0) invalid('revision is not a non-negative integer');
+    else out.revision = raw.revision;
+  }
+  if (raw.content_sha256 !== undefined) {
+    if (!/^[0-9a-f]{64}$/i.test(String(raw.content_sha256))) invalid('content_sha256 is not a SHA-256');
+    else out.content_sha256 = String(raw.content_sha256).toLowerCase();
+  }
+  if (raw.mutation_uuid !== undefined) {
+    if (!isUuid(raw.mutation_uuid)) invalid('mutation_uuid is not a UUID');
+    else out.mutation_uuid = String(raw.mutation_uuid).toLowerCase();
+  }
+  return out;
+}
+
+function loadDraftState(input, session) {
+  const path = draftStatePath(input, session);
+  return normalizeDraftState(readJsonFile(path, 'human draft state'), { strict: true, path });
+}
+
+function saveDraftState(input, session, state) {
+  // Keep this persistence surface intentionally tiny: resource IDs, CAS
+  // revision, content fingerprint, and the resumable mutation UUID only.
+  writeJsonAtomic(draftStatePath(input, session), normalizeDraftState({
+    version: DRAFT_STATE_VERSION,
+    book_id: state.book_id,
+    lesson_id: state.lesson_id,
+    revision: state.revision,
+    content_sha256: state.content_sha256,
+    mutation_uuid: state.mutation_uuid,
+  }));
 }
 
 function normalizeProjectState(existing) {
@@ -1193,6 +1662,482 @@ async function cmdDoctor() {
   const home = await api(creds, "GET", "/api/v1/agent/home");
   info(`${c.green("OK")}  agent @${home.agent?.handle || "?"}, ${home.quota?.daily_create_remaining ?? "?"} create(s) left today`);
   printOwnerStatus(home, creds);
+}
+
+function printDraftHelp() {
+  info(`${c.bold('luguo draft')} - private human-account drafts (cookie session; no admission)
+
+Session:
+  luguo draft login --email EMAIL [--password-stdin]
+      [--env dev|prod|local | --base-url URL] [--context NAME]
+  luguo draft status [--json] [--context NAME]
+  luguo draft logout [--context NAME | --all]
+
+Drafts:
+  luguo draft save <file.md> [--lesson UUID] [--book UUID] [--json]
+  luguo draft pull <file.md> [--lesson UUID] [--force]
+  luguo draft pull --lesson UUID --print
+  luguo draft reset <file.md> [--yes]
+
+The draft namespace is fail-closed: it creates only private containers, creates
+chapters with byte-empty markdown, and writes non-empty content only through the
+lesson draft CAS endpoint. It never calls agent, validate, admission, publish,
+or ordinary lesson PATCH routes. Cookies are stored only in the 0600 user
+session file. Draft receipts live outside the project in ~/.config/luguo/drafts
+and contain only IDs, revision, content SHA, and one mutation UUID.`);
+}
+
+async function cmdDraftLogin(args) {
+  if (args.password !== undefined) {
+    die('Do not pass passwords as command-line arguments. Use the hidden prompt or --password-stdin.');
+  }
+  const email = String(args.email || '').trim();
+  if (!email || !email.includes('@')) {
+    die('Usage: luguo draft login --email you@example.com [--password-stdin]');
+  }
+  const fromStdin = strictBooleanFlag(args, 'password-stdin');
+  let password = fromStdin
+    ? await secretFromStdin()
+    : await promptHidden('Password: ');
+  if (!password) {
+    die('No password received. Use an interactive terminal or pipe it to --password-stdin.');
+  }
+  const base = explicitHumanBase(args) || DEFAULT_BASE;
+  const ephemeral = {
+    store: normalizeHumanSessionStore(null),
+    name: null,
+    base_url: requireHumanBase(base),
+    cookies: {},
+    persisted: false,
+  };
+  const signedIn = await humanRequest(ephemeral, 'POST', '/api/auth/signin', {
+    body: { email, password },
+    secrets: [password],
+  });
+  if (signedIn.json?.success !== true || Object.keys(ephemeral.cookies).length === 0) {
+    password = '';
+    die('Signin did not establish a verified cookie session. No session was saved.');
+  }
+  const me = await humanRequest(ephemeral, 'GET', '/api/auth/me', { secrets: [password] });
+  const verifiedEmail = typeof me.json?.user?.email === 'string' ? me.json.user.email.trim() : '';
+  if (me.json?.authenticated !== true || verifiedEmail.toLowerCase() !== email.toLowerCase()) {
+    password = '';
+    die('The verified human session does not match the requested email. No session was saved.');
+  }
+  password = '';
+  const name = saveHumanSession(args, ephemeral.base_url, ephemeral.cookies);
+  ok(`Human draft session saved for ${ephemeral.base_url} (context "${name}").`);
+}
+
+function cmdDraftLogout(args) {
+  const store = loadHumanSessionStore();
+  if (strictBooleanFlag(args, 'all')) {
+    saveHumanSessionStore({ version: HUMAN_SESSION_VERSION, current: null, contexts: {} });
+    ok('Removed all human draft sessions locally.');
+    return;
+  }
+  const name = args.context ? requireHumanContextName(args.context) : store.current;
+  if (!name || !store.contexts[name]) die('No matching human draft session.');
+  delete store.contexts[name];
+  if (store.current === name) store.current = Object.keys(store.contexts)[0] ?? null;
+  saveHumanSessionStore(store);
+  ok(`Removed human draft context "${name}" locally.`);
+}
+
+async function cmdDraftStatus(args) {
+  const session = loadHumanSession(args);
+  const me = await humanRequest(session, 'GET', '/api/auth/me');
+  if (me.json?.authenticated !== true || !me.json?.user?.id) {
+    die('The human draft session is not authenticated. Run `luguo draft login` again.');
+  }
+  if (strictBooleanFlag(args, 'json')) {
+    printJson({
+      context: session.name,
+      base_url: session.base_url,
+      user: {
+        id: me.json.user.id,
+        email: me.json.user.email ?? null,
+      },
+    });
+    return;
+  }
+  info(`${session.name}  ${safeInlineText(me.json.user.email || me.json.user.id)}  ${c.dim(session.base_url)}`);
+}
+
+function requireDraftReceipt(value, label) {
+  const draft = value?.draft;
+  if (
+    !draft || typeof draft !== 'object' || Array.isArray(draft) ||
+    typeof draft.title !== 'string' || typeof draft.markdown !== 'string' ||
+    !Number.isInteger(draft.revision) || draft.revision < 0 ||
+    !Number.isInteger(draft.published_revision) || draft.published_revision < 0
+  ) die(`${label} did not return a complete draft receipt.`);
+  return draft;
+}
+
+async function readHumanDraft(session, lessonId) {
+  const out = await humanRequest(session, 'GET', `/api/lessons/${lessonId}/draft`, {
+    retryTransient: true,
+  });
+  return requireDraftReceipt(out.json, `Lesson ${lessonId}`);
+}
+
+async function requirePrivateBook(session, bookId) {
+  const out = await humanRequest(session, 'GET', `/api/books/${bookId}`, {
+    retryTransient: true,
+  });
+  const book = out.json?.book;
+  if (!book || typeof book !== 'object' || book.id !== bookId) {
+    die(`Book ${bookId} did not return an owner-editable metadata receipt.`);
+  }
+  if (book.visibility !== 'private') {
+    die(`Book ${bookId} is ${safeInlineText(book.visibility || 'not private')}; human draft writes require a private book.`);
+  }
+  return book;
+}
+
+async function requirePrivateLesson(session, lessonId, expectedBookId = null) {
+  const out = await humanRequest(session, 'GET', `/api/lessons/${lessonId}`, {
+    retryTransient: true,
+  });
+  const lesson = out.json?.lesson;
+  if (!lesson || typeof lesson !== 'object' || lesson.id !== lessonId) {
+    die(`Lesson ${lessonId} did not return an owner-editable metadata receipt.`);
+  }
+  if (lesson.visibility !== 'private') {
+    die(`Lesson ${lessonId} is ${safeInlineText(lesson.visibility || 'not private')}; refusing to write its draft.`);
+  }
+  const bookId = isUuid(lesson.book_id) ? String(lesson.book_id).toLowerCase() : null;
+  if (expectedBookId && bookId !== expectedBookId) {
+    die(`Lesson ${lessonId} is not attached to the expected private book ${expectedBookId}.`);
+  }
+  if (bookId) await requirePrivateBook(session, bookId);
+  return { lesson, bookId };
+}
+
+async function patchHumanDraft(session, {
+  lessonId,
+  title,
+  markdown,
+  expectedRevision,
+  publishedRevision,
+  mutationUuid,
+}) {
+  const out = await humanRequest(session, 'PATCH', `/api/lessons/${lessonId}/draft`, {
+    body: {
+      title,
+      markdown,
+      expected_revision: expectedRevision,
+      client_mutation_id: mutationUuid,
+    },
+    allowStatuses: [409],
+    retryTransient: true,
+  });
+  if (out.status === 409) {
+    die(`Draft conflict for lesson ${lessonId}; no overwrite was attempted. Pull the remote draft, reconcile it, then save again.`);
+  }
+  const saved = requireDraftReceipt(out.json, `Lesson ${lessonId} CAS save`);
+  if (
+    saved.revision <= expectedRevision ||
+    saved.published_revision !== publishedRevision ||
+    saved.title !== title || saved.markdown !== markdown
+  ) {
+    die(`Lesson ${lessonId} returned an unsafe or mismatched draft receipt; refusing to record success.`);
+  }
+  return saved;
+}
+
+function draftSaveOutput(args, receipt) {
+  if (strictBooleanFlag(args, 'json')) {
+    printJson(receipt);
+    return;
+  }
+  ok(`Private draft saved: lesson ${receipt.lesson_id}, revision ${receipt.revision}.`);
+  info(c.dim(`  content sha256 ${receipt.content_sha256}`));
+  if (receipt.editor_url) info(`  editor  ${receipt.editor_url}`);
+}
+
+function safeHumanEditorUrl(base, value) {
+  if (typeof value !== 'string' || !/^\/lessons\/[A-Za-z0-9-]+\/edit$/.test(value)) return null;
+  return `${base}${value}`;
+}
+
+async function saveExistingHumanDraft(session, args, input, lesson, state) {
+  const lessonId = requireUuid(state.lesson_id, 'Lesson id');
+  const current = await readHumanDraft(session, lessonId);
+  const metadata = await requirePrivateLesson(session, lessonId, state.book_id ?? null);
+  if (metadata.bookId && !state.book_id) state.book_id = metadata.bookId;
+
+  const localHash = draftContentSha256(lesson.title, lesson.markdown);
+  const remoteMatchesLocal = current.markdown === lesson.markdown && current.title === lesson.title;
+  if (
+    Number.isInteger(state.revision) &&
+    current.revision !== state.revision &&
+    !remoteMatchesLocal
+  ) {
+    die(`Remote draft ${lessonId} changed after local revision ${state.revision}; pull and reconcile before saving.`);
+  }
+
+  if (remoteMatchesLocal) {
+    state.revision = current.revision;
+    state.content_sha256 = localHash;
+    saveDraftState(input, session, state);
+    draftSaveOutput(args, {
+      book_id: state.book_id ?? null,
+      lesson_id: lessonId,
+      revision: current.revision,
+      content_sha256: localHash,
+      mutation_uuid: state.mutation_uuid,
+      unchanged: true,
+    });
+    return;
+  }
+
+  // The canonical hash includes both title and markdown. Reuse a UUID only
+  // when resuming the exact same unacknowledged CAS payload.
+  if (state.content_sha256 !== localHash || !isUuid(state.mutation_uuid)) {
+    state.mutation_uuid = randomUUID();
+  }
+  state.content_sha256 = localHash;
+  state.revision = current.revision;
+  saveDraftState(input, session, state);
+
+  const saved = await patchHumanDraft(session, {
+    lessonId,
+    title: lesson.title,
+    markdown: lesson.markdown,
+    expectedRevision: current.revision,
+    publishedRevision: current.published_revision,
+    mutationUuid: state.mutation_uuid,
+  });
+  state.revision = saved.revision;
+  saveDraftState(input, session, state);
+  draftSaveOutput(args, {
+    book_id: state.book_id ?? null,
+    lesson_id: lessonId,
+    revision: saved.revision,
+    content_sha256: localHash,
+    mutation_uuid: state.mutation_uuid,
+    unchanged: false,
+  });
+}
+
+async function cmdDraftSave(args) {
+  const input = resolve(args._[2] || '');
+  if (!args._[2] || !existsSync(input) || !statSync(input).isFile()) {
+    die('Usage: luguo draft save <file.md> [--lesson UUID] [--book UUID]');
+  }
+  if (extname(input).toLowerCase() !== '.md') die('Human drafts require one .md file.');
+  const lesson = loadLessonFile(input);
+  if (lesson.markdown.length > DRAFT_MARKDOWN_MAX_CHARS) {
+    die(`Human draft markdown exceeds ${DRAFT_MARKDOWN_MAX_CHARS} characters; no request or local receipt was written.`);
+  }
+  const session = loadHumanSession(args);
+  const localHash = draftContentSha256(lesson.title, lesson.markdown);
+  const createHash = draftCreateSha256(lesson);
+  const prior = loadDraftState(input, session);
+  let state = { ...prior };
+
+  const requestedLesson = args.lesson ? requireUuid(args.lesson, 'Lesson id') : null;
+  const requestedBook = args.book ? requireUuid(args.book, 'Book id') : null;
+  const pendingCreate = !state.lesson_id && isUuid(state.mutation_uuid);
+  if (pendingCreate) {
+    if (!state.content_sha256 || state.content_sha256 !== createHash) {
+      die(`A private-container mutation for this source is still unconfirmed and its content changed. Refusing to reuse it; run \`luguo draft reset ${input} --yes\` only if you accept a possible orphan private container.`);
+    }
+    if (requestedLesson) {
+      die('A private-container mutation is still unconfirmed; refusing to retarget it to a lesson. Reset the local receipt explicitly first.');
+    }
+    if (requestedBook && requestedBook !== state.book_id) {
+      die('A private-container mutation is still unconfirmed; refusing to change its target book. Reset the local receipt explicitly first.');
+    }
+  }
+  if (requestedLesson && state.lesson_id && requestedLesson !== state.lesson_id) {
+    die(`Local draft state already binds this source to lesson ${state.lesson_id}; reset the local receipt before retargeting it.`);
+  }
+  if (requestedLesson) state.lesson_id = requestedLesson;
+  if (requestedBook && state.book_id && requestedBook !== state.book_id) {
+    die(`Local draft state already binds this source to book ${state.book_id}; reset the local receipt before retargeting it.`);
+  }
+  if (requestedBook) state.book_id = requestedBook;
+
+  if (state.lesson_id) {
+    if (!isUuid(state.mutation_uuid)) state.mutation_uuid = randomUUID();
+    await saveExistingHumanDraft(session, args, input, lesson, state);
+    return;
+  }
+
+  // Persist both the resumable mutation and its exact creation fingerprint
+  // before the first write. A changed source or target book fails closed until
+  // the user explicitly resets the local receipt.
+  if (!isUuid(state.mutation_uuid)) state.mutation_uuid = randomUUID();
+  state.content_sha256 = createHash;
+  saveDraftState(input, session, state);
+
+  let verifyBookBeforeChapter = Boolean(state.book_id);
+  if (!state.book_id) {
+    const bookOut = await humanRequest(session, 'POST', '/api/books', {
+      body: {
+        title: lesson.title,
+        summary: lesson.summary || '',
+        tags: lesson.tags || [],
+        visibility: 'private',
+        cover_emoji: lesson.emoji || '📚',
+        language: lesson.language || 'zh',
+      },
+      idempotencyKey: state.mutation_uuid,
+      retryTransient: true,
+      allowStatuses: [409],
+    });
+    if (bookOut.status === 409) die('Private book creation idempotency conflict; no chapter was created.');
+    const bookId = bookOut.json?.book?.id;
+    state.book_id = requireUuid(bookId, 'Created book id');
+    saveDraftState(input, session, state);
+    verifyBookBeforeChapter = bookOut.status !== 201 || bookOut.json?.idempotent_replay === true;
+  }
+  if (verifyBookBeforeChapter) await requirePrivateBook(session, state.book_id);
+
+  const chapterOut = await humanRequest(session, 'POST', `/api/books/${state.book_id}/chapters`, {
+    body: { title: lesson.title, summary: lesson.summary || '', markdown: '' },
+    idempotencyKey: state.mutation_uuid,
+    retryTransient: true,
+    allowStatuses: [409],
+  });
+  if (chapterOut.status === 409) die('Private empty-chapter creation conflict; no draft body was written.');
+  if (chapterOut.json?.admission || chapterOut.json?.queued === true) {
+    die('The empty chapter unexpectedly entered admission; refusing to write non-empty content.');
+  }
+  const lessonId = requireUuid(chapterOut.json?.lesson?.id, 'Created lesson id');
+  if (chapterOut.json?.lesson?.status !== 'draft' || chapterOut.json?.chapter?.lesson_id !== lessonId) {
+    die('Empty chapter did not return a private draft graph receipt.');
+  }
+  await requirePrivateLesson(session, lessonId, state.book_id);
+  state.lesson_id = lessonId;
+  state.revision = 0;
+  state.content_sha256 = localHash;
+  saveDraftState(input, session, state);
+
+  const saved = await patchHumanDraft(session, {
+    lessonId,
+    title: lesson.title,
+    markdown: lesson.markdown,
+    expectedRevision: 0,
+    publishedRevision: 0,
+    mutationUuid: state.mutation_uuid,
+  });
+  state.revision = saved.revision;
+  saveDraftState(input, session, state);
+  draftSaveOutput(args, {
+    book_id: state.book_id,
+    lesson_id: lessonId,
+    revision: saved.revision,
+    content_sha256: localHash,
+    mutation_uuid: state.mutation_uuid,
+    unchanged: false,
+    editor_url: safeHumanEditorUrl(session.base_url, chapterOut.json.lesson.url),
+  });
+}
+
+function draftDocument(draft, lesson) {
+  const frontmatter = [`title: ${JSON.stringify(draft.title)}`];
+  if (typeof lesson?.summary === 'string' && lesson.summary) {
+    frontmatter.push(`summary: ${JSON.stringify(lesson.summary)}`);
+  }
+  if (Array.isArray(lesson?.tags) && lesson.tags.length > 0) {
+    frontmatter.push(`tags: ${JSON.stringify(lesson.tags.map(String))}`);
+  }
+  frontmatter.push('visibility: private');
+  if (typeof lesson?.language === 'string' && lesson.language) {
+    frontmatter.push(`language: ${JSON.stringify(lesson.language)}`);
+  }
+  const emoji = lesson?.cover_emoji ?? lesson?.emoji;
+  if (typeof emoji === 'string' && emoji) frontmatter.push(`emoji: ${JSON.stringify(emoji)}`);
+  return ['---', ...frontmatter, '---', '', draft.markdown, ''].join('\n');
+}
+
+async function cmdDraftPull(args) {
+  const targetArg = args._[2];
+  const print = strictBooleanFlag(args, 'print');
+  if (!targetArg && !print) {
+    die('Usage: luguo draft pull <file.md> [--lesson UUID] [--force], or --lesson UUID --print.');
+  }
+  const target = targetArg ? resolve(targetArg) : null;
+  const session = loadHumanSession(args);
+  const prior = target ? loadDraftState(target, session) : { version: DRAFT_STATE_VERSION };
+  const requestedLesson = args.lesson ? requireUuid(args.lesson, 'Lesson id') : null;
+  if (requestedLesson && prior.lesson_id && requestedLesson !== prior.lesson_id) {
+    die(`Local draft state already binds this source to lesson ${prior.lesson_id}; reset the local receipt before pulling another lesson.`);
+  }
+  const lessonId = requireUuid(requestedLesson || prior.lesson_id, 'Lesson id');
+  const draft = await readHumanDraft(session, lessonId);
+  const metadata = await requirePrivateLesson(session, lessonId, prior.book_id ?? null);
+  const document = draftDocument(draft, metadata.lesson);
+
+  if (print) {
+    process.stdout.write(document);
+  } else {
+    if (existsSync(target) && !strictBooleanFlag(args, 'force')) {
+      const same = readFileSync(target, 'utf8') === document;
+      if (!same) die(`${target} differs from the remote draft. Pass --force only after reviewing the conflict.`);
+    }
+    writeFileSync(target, document);
+    ok(`Private draft pulled: lesson ${lessonId} → ${target}`);
+  }
+  // --print is observational only: never advance a file's CAS baseline unless
+  // those exact bytes were actually written to that file.
+  if (target && !print) {
+    saveDraftState(target, session, {
+      version: DRAFT_STATE_VERSION,
+      book_id: metadata.bookId ?? prior.book_id,
+      lesson_id: lessonId,
+      revision: draft.revision,
+      content_sha256: draftContentSha256(draft.title, draft.markdown),
+      mutation_uuid: prior.mutation_uuid,
+    });
+  }
+}
+
+async function cmdDraftReset(args) {
+  const targetArg = args._[2];
+  if (!targetArg || extname(targetArg).toLowerCase() !== '.md') {
+    die('Usage: luguo draft reset <file.md> [--yes]');
+  }
+  const target = resolve(targetArg);
+  const session = loadHumanSession(args);
+  const path = draftStatePath(target, session);
+  if (!existsSync(path)) {
+    ok(`No local human draft receipt exists for ${target}.`);
+    return;
+  }
+  const confirmed = strictBooleanFlag(args, 'yes') || await promptConfirm(
+    'Discard this local receipt? A previously created private container may remain orphaned',
+  );
+  if (!confirmed) die('Reset cancelled. Pass --yes only after accepting the possible orphan private container.');
+  unlinkSync(path);
+  ok(`Removed only the local human draft receipt for ${target}.`);
+}
+
+async function cmdDraft(args) {
+  const sub = args._[1] || 'help';
+  if (sub === 'publish' || sub === 'validate' || sub === 'admission') {
+    die(`\`luguo draft ${sub}\` is forbidden: the human draft context never calls model-backed or admission endpoints.`);
+  }
+  const commands = {
+    login: cmdDraftLogin,
+    logout: cmdDraftLogout,
+    status: cmdDraftStatus,
+    whoami: cmdDraftStatus,
+    save: cmdDraftSave,
+    pull: cmdDraftPull,
+    reset: cmdDraftReset,
+    help: printDraftHelp,
+  };
+  const fn = commands[sub];
+  if (typeof fn !== 'function') {
+    printDraftHelp();
+    die(`Unknown draft command: ${sub}`);
+  }
+  await fn(args);
 }
 
 const LESSON_TEMPLATE = `---
@@ -1929,6 +2874,12 @@ Authoring:
   luguo validate <file.md | dir>                 server-side validation preview
   luguo skill [--save]                           fetch the luma-md guide (/skill.md)
 
+Private human-account drafts (separate cookie session; zero admission):
+  luguo draft login --email EMAIL [--password-stdin]
+  luguo draft status | logout
+  luguo draft save <file.md> [--lesson UUID] [--book UUID] [--json]
+  luguo draft pull <file.md> [--lesson UUID] [--force|--print]
+
 Publishing:
   luguo publish <file.md | dir>                  create OR update via the automatic admission gate
       [--as-owner] [--new] [--lesson ID] [--title T] [--summary S]
@@ -1994,6 +2945,7 @@ const table = {
   contexts: cmdContext,
   status: cmdStatus,
   whoami: cmdStatus,
+  draft: cmdDraft,
   doctor: cmdDoctor,
   init: cmdInit,
   validate: cmdValidate,

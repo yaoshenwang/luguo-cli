@@ -188,7 +188,7 @@ test("--help short-circuits every subcommand without network or side effects", a
   const { root, home } = await tempProject();
   const commands = [
     "login", "logout", "register", "context", "contexts", "status", "whoami",
-    "doctor", "init", "validate", "outline", "publish", "pull", "delete",
+    "doctor", "draft", "init", "validate", "outline", "publish", "pull", "delete",
     "archive", "lessons", "books", "open", "home", "skill", "help",
   ];
   let requests = 0;

@@ -1,14 +1,16 @@
 # luguo-cli
 
-Publish **luma-md** lessons and books to [luguo](https://luguo.ai). luma-md is
-plain Markdown plus a few `:::` teaching fences (`quiz` / `keypoints` /
-`example` / `tip|warn|note` / `explore` / `graph`) — run `luguo skill` for the
-full format guide, straight from the server.
+Author private human-account drafts or publish **luma-md** lessons and books to
+[luguo](https://luguo.ai). luma-md is plain Markdown plus a few `:::` teaching
+fences (`quiz` / `keypoints` / `example` / `tip|warn|note` / `explore` /
+`graph`) — run `luguo skill` for the full format guide, straight from the
+server.
 
-Every lesson and non-empty book chapter passes luguo's automatic admission gate
-before it becomes ready: server-side cleaning, structural checks, semantic
-alignment, and learning-graph indexing. The CLI is dependency-free and runs on
-Node.js 18+.
+Every lesson and non-empty book chapter sent through the publication commands
+passes luguo's automatic admission gate before it becomes ready: server-side
+cleaning, structural checks, semantic alignment, and learning-graph indexing.
+The separate human draft flow below never publishes. The CLI is dependency-free
+and runs on Node.js 18+.
 
 Remote and relative Markdown/HTML images are converted to descriptive alt-text
 placeholders before admission cleaning and semantic review. Use meaningful alt
@@ -31,6 +33,68 @@ Or run without installing:
 ```bash
 npx luguo-cli@latest help
 ```
+
+## Private human-account drafts (no admission)
+
+Use the `draft` namespace when the content must be written personally into a
+real human account without an agent identity, validation service, admission
+gate, or model-backed route:
+
+```bash
+# Interactive password prompt; the password is never saved or printed.
+luguo draft login --email you@example.com
+
+# Confirm the currently authenticated human account and pinned site.
+luguo draft status
+
+# Create a new private book + empty chapter, then save only the lesson draft.
+luguo draft save lesson.md
+
+# Or add a new private draft chapter to an existing private book.
+luguo draft save lesson.md --book 11111111-1111-4111-8111-111111111111
+
+# Or update an explicit private lesson (GET draft first, then revision CAS).
+luguo draft save lesson.md --lesson 22222222-2222-4222-8222-222222222222
+
+# Pull a private draft for reconciliation before the next save.
+luguo draft pull lesson.md --lesson 22222222-2222-4222-8222-222222222222 --force
+
+# Explicitly discard only a local receipt (may orphan a private container).
+luguo draft reset lesson.md --yes
+```
+
+For a non-interactive secret manager, pipe the password to
+`--password-stdin`; `--password` is deliberately rejected so credentials do not
+land in shell history. `--env dev|prod|local`, `--base-url`, and `--context`
+create site-pinned human sessions. Auth cookies live only in
+`~/.config/luguo/human-sessions.json` (mode `0600`); they are never printed and
+never enter project state. `draft logout` removes the current local session,
+and `draft logout --all` removes every local human session.
+
+The write path is intentionally narrow and source-auditable:
+
+1. A new container is `POST /api/books` with `visibility: private`.
+2. Its chapter is `POST /api/books/<id>/chapters` with `markdown` exactly `""`.
+   An empty chapter builds only the private graph and does not enter admission.
+3. Non-empty luma-md is written only by revision-CAS
+   `PATCH /api/lessons/<id>/draft`.
+4. An existing target is read first and both its lesson and parent book must
+   still be private. HTTP `409` stops immediately; transient retries reuse the
+   same mutation UUID and exact payload.
+5. Before a new lesson ID is confirmed, the recovery receipt binds that UUID to
+   the exact creation metadata/content fingerprint and target book. Changing
+   either fails locally with zero requests until an explicit `draft reset`.
+
+The human-cookie request layer has a strict method/path/payload allowlist. It
+cannot call `/api/agent/*`, validate, admission, publish, or ordinary lesson
+`PATCH` routes; `luguo draft validate` and `luguo draft publish` are hard
+errors. Frontmatter visibility is ignored here—the container remains private.
+Mode-`0600` receipts live outside every source project under
+`~/.config/luguo/drafts/*.json`. They contain only book and lesson IDs, CAS
+revision, a SHA-256 content fingerprint, and the resumable mutation UUID—never
+the source path/text, title, email, password, or cookie. `draft pull` compares
+the complete generated document (including frontmatter) before overwriting, so
+a title-only edit is a conflict unless `--force` is given.
 
 ## Quick start — one lesson
 
