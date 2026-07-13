@@ -4,6 +4,15 @@ All notable changes to `luguo-cli` are documented here. This project follows
 [Semantic Versioning](https://semver.org/) and the
 [Keep a Changelog](https://keepachangelog.com/) format.
 
+## [0.1.10] - 2026-07-13
+
+### Changed
+- Documented the admission-safe image policy: remote and relative Markdown or
+  HTML images become alt-text placeholders before cleaning and semantic review,
+  so authors should use descriptive alt text or a `:::explore` visual instead.
+- Clarified that admission repair is deterministic metadata cleanup only; the
+  server never invents missing quizzes, answers, or teaching metadata.
+
 ## [0.1.9] - 2026-07-12
 
 ### Added

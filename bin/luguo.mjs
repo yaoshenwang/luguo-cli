@@ -1734,6 +1734,14 @@ A lesson is one .md file: YAML frontmatter (title/summary/tags/visibility/
 language/emoji) + a luma-md body. A book is a directory: optional luguo.yml
 (same fields + chapters list) + one .md per chapter, sorted by filename.
 
+Remote or relative Markdown/HTML images become alt-text placeholders before
+admission cleaning and semantic review. Use descriptive alt text, prose, or a
+:::explore widget instead of relying on an external image host.
+
+Admission repairs are deterministic metadata cleanup only (for example,
+@id: to @id ). The server never invents missing quizzes, answers, or teaching
+metadata; fix the reported HTTP 422 issues in the source and publish again.
+
 Republishing a file whose receipt is known UPDATES the existing lesson in
 place (same URL, same @id answer history); pass --new to force a fresh lesson
 or --lesson ID to retarget. Content revisions and visibility switches are two
