@@ -1257,6 +1257,170 @@ test("book chapters pass the same gate and retain per-chapter admission receipts
   }
 });
 
+test("outline v1 publishes Unit -> Module -> Topic payloads and finalizes a private book", async () => {
+  const { root, home } = await tempProject();
+  const bookRoot = join(root, "textbook");
+  await mkdir(bookRoot);
+  await writeFile(
+    join(bookRoot, "luguo.yml"),
+    "title: Structured book\nvisibility: private\nlanguage: en\noutline: outline.json\n",
+  );
+  await writeFile(join(bookRoot, "01-slope.md"), LESSON);
+  await writeFile(
+    join(bookRoot, "02-intercept.md"),
+    LESSON
+      .replaceAll("Mock admission lesson", "Intercept lesson")
+      .replace("tags: [test]", "tags: [geometry, intercept]\nlanguage: fr\nemoji: 🧭"),
+  );
+  const outline = {
+    version: 1,
+    units: [{
+      key: "unit-1",
+      title: "Algebra foundations",
+      position: 1,
+      modules: [{
+        key: "unit-1-module-1",
+        title: "Linear relationships",
+        position: 1,
+        // Deliberately reversed: normalized position is authoritative.
+        chapters: [
+          { file: "02-intercept.md", position: 2 },
+          { file: "01-slope.md", position: 1 },
+        ],
+      }],
+    }],
+  };
+  await writeFile(join(bookRoot, "outline.json"), JSON.stringify(outline));
+  const normalizedOutline = {
+    ...outline,
+    units: [{
+      ...outline.units[0],
+      modules: [{
+        ...outline.units[0].modules[0],
+        chapters: [
+          { file: "01-slope.md", position: 1 },
+          { file: "02-intercept.md", position: 2 },
+        ],
+      }],
+    }],
+  };
+  const outlineHash = createHash("sha256")
+    .update(canonicalJson(normalizedOutline))
+    .digest("hex");
+  const chapterBodies = [];
+  const keys = [];
+  try {
+    await withMock(async (req, res) => {
+      keys.push({ path: `${req.method} ${req.url}`, key: req.headers["idempotency-key"] });
+      if (req.method === "POST" && req.url === "/api/books") {
+        const body = await readJsonBody(req);
+        assert.equal(body.visibility, "private");
+        assert.equal(body.outline_hash, outlineHash);
+        sendJson(res, 201, { book: { id: "book_outline_1", slug: "structured-book" } });
+        return;
+      }
+      if (req.method === "POST" && req.url === "/api/books/book_outline_1/chapters") {
+        const body = await readJsonBody(req);
+        chapterBodies.push(body);
+        const number = chapterBodies.length;
+        sendJson(res, 201, {
+          chapter: { id: `chapter_outline_${number}`, lesson_id: `lesson_outline_${number}` },
+          lesson: { id: `lesson_outline_${number}`, slug: `outline-topic-${number}` },
+          course: { id: "course_outline_1", slug: "structured-course" },
+          admission: READY_ADMISSION,
+        });
+        return;
+      }
+      if (req.method === "PATCH" && req.url === "/api/books/book_outline_1") {
+        assert.deepEqual(await readJsonBody(req), { finalize: true });
+        sendJson(res, 200, {
+          publication: { id: "publication_outline_1", status: "committed" },
+          book: { id: "book_outline_1", visibility: "private", status: "ready" },
+        });
+        return;
+      }
+      sendJson(res, 404, { error: "Not found" });
+    }, async (baseUrl) => {
+      const out = await runCli(["publish", bookRoot], { cwd: root, home, baseUrl });
+      assert.equal(out.code, 0, out.stderr);
+      assert.match(out.stdout, /Book published: Structured book \(2 chapter\(s\), private\)/);
+    });
+
+    assert.equal(chapterBodies.length, 2);
+    assert.deepEqual(chapterBodies.map((body) => body.hierarchy.topic_position), [1, 2]);
+    assert.deepEqual(chapterBodies.map((body) => body.tags), [
+      ["test"],
+      ["geometry", "intercept"],
+    ]);
+    assert.deepEqual(chapterBodies.map((body) => body.language), ["en", "fr"]);
+    assert.deepEqual(chapterBodies.map((body) => body.cover_emoji), ["📚", "🧭"]);
+    assert.ok(chapterBodies.every((body) => !("visibility" in body)));
+    for (const body of chapterBodies) {
+      assert.equal(body.outline_hash, outlineHash);
+      assert.deepEqual(body.hierarchy.unit, {
+        key: "unit-1", title: "Algebra foundations", position: 1,
+      });
+      assert.deepEqual(body.hierarchy.module, {
+        key: "unit-1-module-1", title: "Linear relationships", position: 1,
+      });
+    }
+    assert.ok(keys.every(({ key }) => /^luguo-cli-v1-[a-f0-9]{64}$/.test(String(key))));
+    const state = JSON.parse(await readFile(join(bookRoot, ".luguo", "state.json"), "utf8"));
+    assert.equal(state.book.outline_hash, outlineHash);
+    assert.equal(state.book.outline_source, "outline.json");
+    assert.deepEqual(state.book.chapters.map((chapter) => chapter.source), [
+      "01-slope.md",
+      "02-intercept.md",
+    ]);
+    assert.deepEqual(
+      state.book.chapters.map((chapter) => chapter.hierarchy.topic_position),
+      [1, 2],
+    );
+    assert.deepEqual(state.book.chapters.map((chapter) => chapter.tags), [
+      ["test"],
+      ["geometry", "intercept"],
+    ]);
+    assert.deepEqual(state.book.chapters.map((chapter) => chapter.language), ["en", "fr"]);
+    assert.deepEqual(state.book.chapters.map((chapter) => chapter.cover_emoji), ["📚", "🧭"]);
+    assert.equal(state.book.publication.status, "committed");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("outline validation fails closed before network when a publishable markdown file is unlisted", async () => {
+  const { root, home } = await tempProject();
+  const bookRoot = join(root, "invalid-textbook");
+  await mkdir(bookRoot);
+  await writeFile(join(bookRoot, "luguo.yml"), "title: Invalid\noutline: outline.json\n");
+  await writeFile(join(bookRoot, "01-listed.md"), LESSON);
+  await writeFile(join(bookRoot, "02-unlisted.md"), LESSON);
+  await writeFile(join(bookRoot, "outline.json"), JSON.stringify({
+    version: 1,
+    units: [{
+      key: "u1", title: "Unit", position: 1,
+      modules: [{
+        key: "u1-m1", title: "Module", position: 1,
+        chapters: [{ file: "01-listed.md", position: 1 }],
+      }],
+    }],
+  }));
+  let requests = 0;
+  try {
+    await withMock((_req, res) => {
+      requests += 1;
+      sendJson(res, 500, { error: "must not reach network" });
+    }, async (baseUrl) => {
+      const out = await runCli(["validate", bookRoot], { cwd: root, home, baseUrl });
+      assert.equal(out.code, 1);
+      assert.match(out.stderr, /Every publishable \.md must appear exactly once.*02-unlisted\.md/);
+    });
+    assert.equal(requests, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("book publish follows a 202 publication saga through atomic commit", async () => {
   const { root, home } = await tempProject();
   const bookRoot = join(root, "book");

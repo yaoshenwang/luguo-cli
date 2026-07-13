@@ -4,6 +4,20 @@ All notable changes to `luguo-cli` are documented here. This project follows
 [Semantic Versioning](https://semver.org/) and the
 [Keep a Changelog](https://keepachangelog.com/) format.
 
+## [0.1.12] - 2026-07-13
+
+### Added
+- Book projects can set `outline: outline.json` and publish a strict
+  Unit → Module → Topic hierarchy. The CLI normalizes and hashes outline v1,
+  validates unique stable keys/positions and complete `.md` coverage, binds the
+  hash and hierarchy to API writes, and records both in the project receipt.
+- Chapter `tags`, `language`, and `emoji` frontmatter now survive book publish;
+  omitted values inherit book metadata, while visibility remains book-scoped.
+
+### Fixed
+- Private multi-chapter books now run the final atomic publication commit and
+  become ready without changing visibility, including claimed-owner workflows.
+
 ## [0.1.11] - 2026-07-13
 
 ### Fixed

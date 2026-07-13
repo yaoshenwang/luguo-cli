@@ -17,7 +17,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, extname, join, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const CRED_PATH = join(homedir(), ".config", "luguo", "credentials.json");
 const LAST_PUBLISH_PATH = join(homedir(), ".config", "luguo", "last-publish.json");
@@ -607,19 +607,166 @@ function loadLessonFile(path) {
   };
 }
 
+function normalizedProjectPath(root, value, label) {
+  const raw = String(value || "").trim().replaceAll("\\", "/");
+  if (!raw) die(`${label} must be a non-empty relative path.`);
+  const absolute = resolve(root, raw);
+  const rel = relative(root, absolute);
+  if (!rel || rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel)) {
+    die(`${label} must stay inside the book directory: ${raw}`);
+  }
+  return rel.split(sep).join("/");
+}
+
+function collectProjectMarkdown(root, current = root) {
+  const files = [];
+  for (const entry of readdirSync(current)) {
+    if (entry.startsWith(".") || entry === "node_modules") continue;
+    const absolute = join(current, entry);
+    const stats = statSync(absolute);
+    if (stats.isDirectory()) {
+      files.push(...collectProjectMarkdown(root, absolute));
+    } else if (/\.md$/i.test(entry) && !entry.startsWith("_")) {
+      files.push(relative(root, absolute).split(sep).join("/"));
+    }
+  }
+  return files.sort();
+}
+
+function outlineString(value, label, maxLength) {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  if (!normalized || normalized.length > maxLength) {
+    die(`${label} must be 1-${maxLength} characters.`);
+  }
+  return normalized;
+}
+
+function outlinePosition(value, label) {
+  if (!Number.isInteger(value) || value < 0 || value > 2_147_483_647) {
+    die(`${label} must be a non-negative integer.`);
+  }
+  return value;
+}
+
+function assertUniquePosition(seen, position, label) {
+  if (seen.has(position)) die(`${label} position ${position} is duplicated.`);
+  seen.add(position);
+}
+
+function loadBookOutline(root, configuredPath) {
+  const source = normalizedProjectPath(root, configuredPath, "outline");
+  const path = resolve(root, source);
+  const input = readJsonFile(path, "book outline");
+  if (!input || input.version !== 1 || !Array.isArray(input.units) || input.units.length === 0) {
+    die(`${source} must be an outline v1 object with a non-empty units array.`);
+  }
+  const unitKeys = new Set();
+  const moduleKeys = new Set();
+  const unitPositions = new Set();
+  const chapterFiles = new Set();
+  const units = input.units.map((unit, unitIndex) => {
+    if (!unit || typeof unit !== "object" || !Array.isArray(unit.modules) || unit.modules.length === 0) {
+      die(`units[${unitIndex}] must contain a non-empty modules array.`);
+    }
+    const key = outlineString(unit.key, `units[${unitIndex}].key`, 80);
+    if (unitKeys.has(key)) die(`Unit key is duplicated: ${key}`);
+    unitKeys.add(key);
+    const position = outlinePosition(unit.position, `units[${unitIndex}].position`);
+    assertUniquePosition(unitPositions, position, "Unit");
+    const modulePositions = new Set();
+    const modules = unit.modules.map((module, moduleIndex) => {
+      if (!module || typeof module !== "object" || !Array.isArray(module.chapters) || module.chapters.length === 0) {
+        die(`Unit ${key} module[${moduleIndex}] must contain a non-empty chapters array.`);
+      }
+      const moduleKey = outlineString(module.key, `modules[${moduleIndex}].key`, 80);
+      if (moduleKeys.has(moduleKey)) die(`Module key is duplicated: ${moduleKey}`);
+      moduleKeys.add(moduleKey);
+      const modulePosition = outlinePosition(module.position, `modules[${moduleIndex}].position`);
+      assertUniquePosition(modulePositions, modulePosition, `Unit ${key} module`);
+      const topicPositions = new Set();
+      const chapters = module.chapters.map((chapter, chapterIndex) => {
+        if (!chapter || typeof chapter !== "object") {
+          die(`Module ${moduleKey} chapter[${chapterIndex}] must be an object.`);
+        }
+        const file = normalizedProjectPath(
+          root,
+          chapter.file,
+          `Module ${moduleKey} chapter[${chapterIndex}].file`,
+        );
+        if (!/\.md$/i.test(file)) die(`Outline chapter must be a .md file: ${file}`);
+        if (!existsSync(resolve(root, file)) || !statSync(resolve(root, file)).isFile()) {
+          die(`Chapter not found: ${file}`);
+        }
+        if (chapterFiles.has(file)) die(`Outline chapter is duplicated: ${file}`);
+        chapterFiles.add(file);
+        const topicPosition = outlinePosition(
+          chapter.position,
+          `Module ${moduleKey} chapter[${chapterIndex}].position`,
+        );
+        assertUniquePosition(topicPositions, topicPosition, `Module ${moduleKey} topic`);
+        return { file, position: topicPosition };
+      }).sort((a, b) => a.position - b.position || a.file.localeCompare(b.file));
+      return {
+        key: moduleKey,
+        title: outlineString(module.title, `modules[${moduleIndex}].title`, 160),
+        position: modulePosition,
+        chapters,
+      };
+    }).sort((a, b) => a.position - b.position || a.key.localeCompare(b.key));
+    return {
+      key,
+      title: outlineString(unit.title, `units[${unitIndex}].title`, 160),
+      position,
+      modules,
+    };
+  }).sort((a, b) => a.position - b.position || a.key.localeCompare(b.key));
+
+  const projectMarkdown = collectProjectMarkdown(root);
+  const unlisted = projectMarkdown.filter((file) => !chapterFiles.has(file));
+  if (unlisted.length > 0) {
+    die(`Every publishable .md must appear exactly once in ${source}; unlisted: ${unlisted.join(", ")}`);
+  }
+  const normalized = { version: 1, units };
+  const hash = createHash("sha256").update(canonicalJson(normalized)).digest("hex");
+  const entries = [];
+  for (const unit of units) {
+    for (const module of unit.modules) {
+      for (const chapter of module.chapters) {
+        entries.push({
+          source: chapter.file,
+          hierarchy: {
+            unit: { key: unit.key, title: unit.title, position: unit.position },
+            module: { key: module.key, title: module.title, position: module.position },
+            topic_position: chapter.position,
+          },
+        });
+      }
+    }
+  }
+  return { source, normalized, hash, entries };
+}
+
 function loadBookDir(root) {
   const yamlPath = ["luguo.yml", "luguo.yaml", "book.yml"].map((n) => join(root, n)).find(existsSync);
   const config = yamlPath ? parseFlatYaml(readFileSync(yamlPath, "utf8")) : {};
-  const chapterPaths = Array.isArray(config.chapters) && config.chapters.length
-    ? config.chapters
-    : readdirSync(root)
-        .filter((name) => /\.md$/i.test(name) && !name.startsWith("_") && !name.startsWith("."))
-        .sort();
-  if (!chapterPaths.length) die(`No chapter .md files in ${root}. Add chapters or a luguo.yml.`);
-  const chapters = chapterPaths.map((rel) => {
-    const abs = resolve(root, String(rel));
+  if (config.outline && Array.isArray(config.chapters) && config.chapters.length) {
+    die("luguo.yml cannot define both outline and chapters; outline is authoritative.");
+  }
+  const outline = config.outline ? loadBookOutline(root, config.outline) : null;
+  const chapterEntries = outline
+    ? outline.entries
+    : (Array.isArray(config.chapters) && config.chapters.length
+        ? config.chapters.map((source) => ({ source: String(source) }))
+        : readdirSync(root)
+            .filter((name) => /\.md$/i.test(name) && !name.startsWith("_") && !name.startsWith("."))
+            .sort()
+            .map((source) => ({ source })));
+  if (!chapterEntries.length) die(`No chapter .md files in ${root}. Add chapters or a luguo.yml.`);
+  const chapters = chapterEntries.map((entry) => {
+    const rel = normalizedProjectPath(root, entry.source, "chapter");
+    const abs = resolve(root, rel);
     if (!existsSync(abs)) die(`Chapter not found: ${rel}`);
-    return { source: String(rel), ...loadLessonFile(abs) };
+    return { source: rel, ...loadLessonFile(abs), hierarchy: entry.hierarchy };
   });
   return {
     title: String(config.title || basename(root)),
@@ -629,6 +776,9 @@ function loadBookDir(root) {
     visibility: VISIBILITIES.includes(config.visibility) ? config.visibility : "private",
     language: config.language ? String(config.language) : "zh",
     emoji: config.emoji || config.cover_emoji ? String(config.emoji || config.cover_emoji) : "📚",
+    outlineHash: outline?.hash,
+    outlineSource: outline?.source,
+    outline: outline?.normalized,
     chapters,
   };
 }
@@ -1119,7 +1269,7 @@ function cmdInit(args) {
     mkdirSync(dir, { recursive: true });
     const yamlPath = join(dir, "luguo.yml");
     if (existsSync(yamlPath)) die(`${yamlPath} already exists.`);
-    writeFileSync(yamlPath, `title: ${basename(dir)}\nsummary: 一句话介绍这本书。\ntags: [示例]\nvisibility: private\nlanguage: zh\nemoji: 📚\n# chapters 缺省时按文件名排序取全部 .md\n`);
+    writeFileSync(yamlPath, `title: ${basename(dir)}\nsummary: 一句话介绍这本书。\ntags: [示例]\nvisibility: private\nlanguage: zh\nemoji: 📚\n# chapters 缺省时按文件名排序取全部 .md\n# 教材层级可改用: outline: outline.json\n`);
     writeFileSync(join(dir, "01-第一章.md"), LESSON_TEMPLATE.replace(/我的第一课/g, "第一章"));
     writeFileSync(join(dir, "02-第二章.md"), LESSON_TEMPLATE.replace(/我的第一课/g, "第二章"));
     ok(`Book project created: ${dir}`);
@@ -1143,6 +1293,7 @@ async function cmdValidate(args) {
   if (statSync(input).isDirectory()) {
     const book = loadBookDir(input);
     info(`${c.bold(book.title)} — ${book.chapters.length} chapter(s)`);
+    if (book.outlineHash) info(`  outline ${book.outlineSource} (${book.outlineHash})`);
     let valid = true;
     for (const chapter of book.chapters) {
       const out = await serverValidate(creds, chapter.markdown);
@@ -1347,6 +1498,7 @@ async function publishBookDir(creds, root, args, context) {
     visibility: "private",
     cover_emoji: args.emoji ? String(args.emoji) : book.emoji,
     language: book.language,
+    ...(book.outlineHash ? { outline_hash: book.outlineHash } : {}),
   };
   const created = await publishApi(creds, "POST", "/api/books", createPayload, {
     authorMode: context.mode,
@@ -1359,10 +1511,19 @@ async function publishBookDir(creds, root, args, context) {
   let course = null;
   for (const chapter of book.chapters) {
     const chapterPath = `/api/books/${bookId}/chapters`;
+    const chapterMetadata = {
+      tags: chapter.tags ?? book.tags,
+      language: chapter.language ?? book.language,
+      cover_emoji: chapter.emoji ?? book.emoji,
+    };
     const chapterPayload = {
       title: chapter.title,
       summary: chapter.summary ?? "",
       markdown: chapter.markdown,
+      ...chapterMetadata,
+      ...(book.outlineHash && chapter.hierarchy
+        ? { outline_hash: book.outlineHash, hierarchy: chapter.hierarchy }
+        : {}),
     };
     const out = await publishApi(creds, "POST", chapterPath, chapterPayload, {
       expectedStatus: 201,
@@ -1376,6 +1537,8 @@ async function publishBookDir(creds, root, args, context) {
       chapter_id: out.chapter?.id,
       lesson_id: out.lesson?.id,
       lesson_slug: out.lesson?.slug,
+      ...chapterMetadata,
+      ...(chapter.hierarchy ? { hierarchy: chapter.hierarchy } : {}),
       authorship,
       admission,
     });
@@ -1383,23 +1546,19 @@ async function publishBookDir(creds, root, args, context) {
     info(`  ${c.green("+")} ${chapter.source} → ${chapter.title} ${c.dim(`(${admission.gate_version}, ready)`)}`);
   }
 
-  let publication = null;
-  let publicationAuthorship = null;
-  if (visibility !== "private") {
-    const publicationResult = await publishApi(
-      creds,
-      "PATCH",
-      `/api/books/${bookId}`,
-      { visibility },
-      { awaitBookPublication: bookId, authorMode: context.mode },
-    );
-    publication = publicationResult.publication;
-    publicationAuthorship = requireAuthorship(
-      publicationResult,
-      context,
-      `Book publication "${book.title}"`,
-    );
-  }
+  const publicationResult = await publishApi(
+    creds,
+    "PATCH",
+    `/api/books/${bookId}`,
+    visibility === "private" ? { finalize: true } : { visibility },
+    { awaitBookPublication: bookId, authorMode: context.mode },
+  );
+  const publication = publicationResult.publication;
+  const publicationAuthorship = requireAuthorship(
+    publicationResult,
+    context,
+    `Book publication "${book.title}"`,
+  );
 
   const workspaceUrl = context.mode === AUTHOR_MODES.owner
     ? absoluteUrl(creds, `/create/${bookId}`)
@@ -1417,6 +1576,10 @@ async function publishBookDir(creds, root, args, context) {
     workspace_url: workspaceUrl,
     publish_as: context.mode,
     authorship: publicationAuthorship || bookAuthorship,
+    ...(book.outlineHash ? {
+      outline_hash: book.outlineHash,
+      outline_source: book.outlineSource,
+    } : {}),
     chapters: published,
     publication,
     published_at: new Date().toISOString(),
@@ -1779,7 +1942,11 @@ Publishing:
 
 A lesson is one .md file: YAML frontmatter (title/summary/tags/visibility/
 language/emoji) + a luma-md body. A book is a directory: optional luguo.yml
-(same fields + chapters list) + one .md per chapter, sorted by filename.
+(same fields + chapters list) + one .md per chapter, sorted by filename. A
+textbook can set \`outline: outline.json\` to publish strict Unit -> Module ->
+Topic hierarchy; validate checks every .md is listed exactly once.
+Chapter tags/language/emoji override book metadata; omitted values inherit it.
+Chapter visibility is never sent because the book owns one publication scope.
 
 Remote or relative Markdown/HTML images become alt-text placeholders before
 admission cleaning and semantic review. Use descriptive alt text, prose, or a
@@ -1800,6 +1967,8 @@ indexed by the server. HTTP 202 is followed until the durable admission is
 ready. Stable Idempotency-Key headers make unchanged retries safe, and publish
 writes and durable status polls retry transient network/429/5xx failures up to
 three times with the same idempotency key; other 4xx responses fail once.
+Private books also run the final atomic commit and become ready without changing
+their private visibility.
 
 By default, content belongs to the agent profile. A claimed agent whose owner
 enabled "Allow publishing as me" can add --as-owner to publish into the

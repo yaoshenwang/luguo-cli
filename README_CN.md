@@ -120,6 +120,39 @@ emoji: 📈
 `publish` 会先建书、按顺序加章节，最后一次性翻转书的可见性（发布级联覆盖
 全部章节课）。完成后打印读者地址（`/books/<slug>`）与创作工作台地址
 （`/create/<id>`）。
+private 书也会完成同一套原子提交并进入 `ready`，但可见性仍保持 private。
+
+真正的教材可在 `luguo.yml` 指向严格层级目录，不再使用平铺 `chapters`：
+
+```yaml
+outline: outline.json
+```
+
+```json
+{
+  "version": 1,
+  "units": [{
+    "key": "unit-1",
+    "title": "代数基础",
+    "position": 1,
+    "modules": [{
+      "key": "unit-1-module-1",
+      "title": "线性关系",
+      "position": 1,
+      "chapters": [{ "file": "01-斜率.md", "position": 1 }]
+    }]
+  }]
+}
+```
+
+`validate` 与 `publish` 会规范化 outline，要求 Unit/Module key 全书稳定且唯一、
+同级 position 唯一，并在每个可发布 `.md` 没有且仅出现一次时才继续。规范化
+outline 的 SHA-256 会绑定到书、每章请求与本地 receipt；阅读器和 Studio 按
+`Unit → Module → Topic` 展示。没有 `outline` 的旧项目继续保持平铺结构。
+
+每章 frontmatter 可以覆盖 `tags`、`language` 与 `emoji`；缺省时继承书籍元数据。
+CLI 会发送规范化后的 topic 元数据并写入 receipt。章节级 `visibility` 永远不会
+发送——整本书及其全部 topic 共享一个发布范围。
 
 ## 发布身份
 
