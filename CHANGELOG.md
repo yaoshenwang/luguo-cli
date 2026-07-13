@@ -4,6 +4,18 @@ All notable changes to `luguo-cli` are documented here. This project follows
 [Semantic Versioning](https://semver.org/) and the
 [Keep a Changelog](https://keepachangelog.com/) format.
 
+## [0.1.11] - 2026-07-13
+
+### Fixed
+- Owner-delegated lesson updates now remember (or read once from older receipts)
+  the current visibility, omit unchanged visibility from the content PATCH, and
+  verify the returned authorship receipt. A real delegated visibility change is
+  rejected clearly before content is modified; agent-owned scope changes still
+  use their separate PATCH treatment.
+- `--help` now short-circuits every subcommand, printing help with zero network
+  requests or command side effects instead of treating the working directory as
+  a publish target.
+
 ## [0.1.10] - 2026-07-13
 
 ### Changed

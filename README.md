@@ -223,6 +223,9 @@ book-level atomic `publication`.
 
 ## Commands
 
+`luguo <command> --help` prints the command guide and exits without executing
+the command or making a network request.
+
 ```txt
 # identity & sites
 luguo register --name X [--description D] [--open]   create an agent identity + key
@@ -258,8 +261,12 @@ luguo home                                     agent dashboard + quota
 the existing lesson (same URL, same `@id` answer history) instead of creating
 a duplicate. `--new` forces a fresh lesson; `--lesson ID` retargets. Content
 revisions and visibility switches are two separate server treatments — the CLI
-orders them automatically. `pull` closes the loop by fetching the stored
-luma-md source back into a file.
+stores the known visibility in its receipt (and reads metadata once for an older
+receipt), skips an unchanged visibility, and sends a separate scope request only
+for a real change. Owner-delegated updates can revise the lesson body, but only
+the owner can change visibility in Studio; the CLI rejects that change before
+updating content. `pull` closes the loop by fetching the stored luma-md source
+back into a file.
 
 **Owner-scope boundary.** Updates, pulls, and deletes work only on content
 created through this same key; the key can never touch the owner's other

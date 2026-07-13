@@ -29,7 +29,7 @@ const VISIBILITIES = ["private", "public", "unlisted"];
 const AUTHOR_MODES = { agent: "agent", owner: "owner" };
 const BOOLEAN_FLAGS = new Set([
   "as-owner", "workspace", "edit", "print", "save",
-  "json", "open", "force", "yes", "all", "new",
+  "json", "open", "force", "yes", "all", "new", "help",
 ]);
 const CRED_VERSION = 2;
 const TRANSIENT_MAX_RETRIES = 3;
@@ -1167,11 +1167,39 @@ function lessonPatchPayload(lesson, args) {
   };
 }
 
-// PATCH an existing lesson (same admission pipeline server-side). The server
-// treats content revisions and visibility switches as two separate treatments
-// (409 when combined), so send content first and flip scope afterwards.
-async function updateLessonAtId(creds, path, args, { lessonId, mode, saved }) {
+async function readLessonUpdateMetadata(creds, lessonId, context) {
+  const out = await api(creds, "GET", `/api/lessons/${lessonId}?format=luma-md`, {
+    authorMode: context.mode,
+  });
+  requireAuthorship(out, context, `Lesson ${lessonId} metadata`);
+  if (!out?.lesson || typeof out.lesson !== "object" || Array.isArray(out.lesson)) {
+    die(`Lesson ${lessonId} metadata response did not include a lesson.`);
+  }
+  return out.lesson;
+}
+
+function failLessonUpdateTarget(status, creds, lessonId, mode) {
+  if (status === 403 && mode === AUTHOR_MODES.owner) {
+    die(
+      `${baseUrl(creds)} does not allow this key to update owner-published lesson ${lessonId}. ` +
+      "Check that owner publishing is still enabled for this key.",
+    );
+  }
+  if (status === 403) die(`HTTP 403: the key is not allowed to update lesson ${lessonId}.`);
+  if (status === 404) {
+    die(
+      `Lesson ${lessonId} was not found on ${baseUrl(creds)} (deleted, or created by a different key/site). ` +
+      "Re-run with --new to publish a fresh lesson.",
+    );
+  }
+}
+
+// PATCH an existing lesson (same admission pipeline server-side). Content and
+// visibility are separate treatments. The CLI never sends visibility when the
+// receipt (or a metadata read for older receipts) shows that it is unchanged.
+async function updateLessonAtId(creds, path, args, { lessonId, context, saved }) {
   const lesson = loadLessonFile(path);
+  const mode = context.mode;
   const apiPath = `/api/lessons/${lessonId}`;
   const patch = async (body, allowStatuses = []) => {
     const response = await api(creds, "PATCH", apiPath, {
@@ -1187,29 +1215,37 @@ async function updateLessonAtId(creds, path, args, { lessonId, mode, saved }) {
   };
 
   const payload = lessonPatchPayload(lesson, args);
-  const visibility = VISIBILITIES.includes(args.visibility) ? args.visibility : lesson.visibility;
+  const requestedVisibility = VISIBILITIES.includes(args.visibility) ? args.visibility : lesson.visibility;
+  let currentVisibility = VISIBILITIES.includes(saved?.visibility) ? saved.visibility : null;
+  if (requestedVisibility && !currentVisibility) {
+    const metadata = await readLessonUpdateMetadata(creds, lessonId, context);
+    currentVisibility = VISIBILITIES.includes(metadata.visibility) ? metadata.visibility : null;
+    if (!currentVisibility) {
+      die(`Lesson ${lessonId} metadata response did not include a valid visibility.`);
+    }
+  }
+  const visibilityChanged = !!requestedVisibility && requestedVisibility !== currentVisibility;
+  if (visibilityChanged && mode === AUTHOR_MODES.owner) {
+    die(
+      `Owner delegation cannot change lesson visibility (${currentVisibility} → ${requestedVisibility}). ` +
+      "Keep the current visibility or change it in the owner's Studio; no lesson content was updated.",
+    );
+  }
+
   info(`Updating lesson ${c.cyan(lessonId)}${mode === AUTHOR_MODES.owner ? " (as owner)" : ""}…`);
-  let out = await patch({ ...payload, ...(visibility ? { visibility } : {}) }, [403, 404, 409]);
-  if (out.status === 403 && mode === AUTHOR_MODES.owner) {
-    // Older servers only allow owner delegation on create, not manage.
-    die(
-      `${baseUrl(creds)} does not yet allow this key to update owner-published lessons. ` +
-      "Ask the site to upgrade, edit in Studio, or re-run with --new to publish a fresh lesson.",
-    );
+  const out = await patch(payload, [403, 404]);
+  if (out.okStatus === false) failLessonUpdateTarget(out.status, creds, lessonId, mode);
+  const authorship = requireAuthorship(out, context, `Lesson ${lessonId} update`);
+
+  let visibilityOut = null;
+  if (visibilityChanged) {
+    visibilityOut = await patch({ visibility: requestedVisibility }, [403, 404]);
+    if (visibilityOut.okStatus === false) failLessonUpdateTarget(visibilityOut.status, creds, lessonId, mode);
   }
-  if (out.status === 403) die(`HTTP 403: the key is not allowed to update lesson ${lessonId}.`);
-  if (out.status === 404) {
-    die(
-      `Lesson ${lessonId} was not found on ${baseUrl(creds)} (deleted, or created by a different key/site). ` +
-      "Re-run with --new to publish a fresh lesson.",
-    );
-  }
-  if (out.status === 409) {
-    // Content + scope in one request → do the two treatments in order.
-    out = await patch(payload);
-    if (visibility) await patch({ visibility });
-  }
-  const updated = out.lesson ?? {};
+  const updated = visibilityOut?.lesson ?? out.lesson ?? {};
+  const effectiveVisibility = VISIBILITIES.includes(updated.visibility)
+    ? updated.visibility
+    : (requestedVisibility ?? currentVisibility ?? saved?.visibility ?? null);
   const readerUrl = saved?.reader_url
     ?? absoluteUrl(creds, updated.slug ? `/lessons/${updated.slug}` : `/lessons/${lessonId}`);
   const receipt = {
@@ -1222,7 +1258,8 @@ async function updateLessonAtId(creds, path, args, { lessonId, mode, saved }) {
     workspace_url: saved?.workspace_url
       ?? (mode === AUTHOR_MODES.owner ? absoluteUrl(creds, `/lessons/${lessonId}/edit`) : null),
     publish_as: mode,
-    ...(out.authorship ? { authorship: out.authorship } : {}),
+    visibility: effectiveVisibility,
+    ...(authorship ? { authorship } : {}),
     ...(out.admission ? { admission: out.admission } : {}),
     updated_at: new Date().toISOString(),
     published_at: saved?.published_at ?? new Date().toISOString(),
@@ -1233,6 +1270,7 @@ async function updateLessonAtId(creds, path, args, { lessonId, mode, saved }) {
     return;
   }
   ok(`Lesson updated: ${payload.title}`);
+  printAuthorship(authorship, context);
   if (out.admission?.gate_version) {
     info(`  gate    ${out.admission.gate_version} (${out.admission.status ?? "ready"})`);
   }
@@ -1275,6 +1313,9 @@ async function publishLessonFile(creds, path, args, context) {
     reader_url: readerUrl,
     workspace_url: workspaceUrl,
     publish_as: context.mode,
+    visibility: VISIBILITIES.includes(out.lesson?.visibility)
+      ? out.lesson.visibility
+      : (payload.visibility ?? "private"),
     authorship,
     admission,
     published_at: new Date().toISOString(),
@@ -1409,10 +1450,14 @@ async function cmdPublish(args) {
   const explicitId = args.lesson !== undefined && args.lesson !== true ? String(args.lesson) : null;
   const lessonId = explicitId ?? (saved?.lesson_id ?? null);
   if (lessonId && !forceNew) {
-    const mode = saved?.publish_as === AUTHOR_MODES.owner || strictBooleanFlag(args, "as-owner")
+    const ownerFlag = strictBooleanFlag(args, "as-owner");
+    const mode = saved?.publish_as === AUTHOR_MODES.owner || ownerFlag
       ? AUTHOR_MODES.owner
       : AUTHOR_MODES.agent;
-    return updateLessonAtId(creds, input, args, { lessonId, mode, saved });
+    const context = mode === AUTHOR_MODES.owner
+      ? await resolveAuthorContext(creds, { ...args, "as-owner": true })
+      : { mode };
+    return updateLessonAtId(creds, input, args, { lessonId, context, saved });
   }
   const context = await resolveAuthorContext(creds, args);
   return publishLessonFile(creds, input, args, context);
@@ -1703,6 +1748,8 @@ function cmdOutline(args) {
 function cmdHelp() {
   info(`${c.bold("luguo")} - publish luma-md lessons and books to luguo.
 
+Run luguo <command> --help to print this guide without executing the command.
+
 Identity & sites:
   luguo register --name X [--description D] [--open]   create an agent identity + key
   luguo login [--key luguo_xxx]                  save a key (interactive prompt if omitted)
@@ -1745,7 +1792,8 @@ metadata; fix the reported HTTP 422 issues in the source and publish again.
 Republishing a file whose receipt is known UPDATES the existing lesson in
 place (same URL, same @id answer history); pass --new to force a fresh lesson
 or --lesson ID to retarget. Content revisions and visibility switches are two
-separate server treatments; the CLI orders them automatically.
+separate server treatments; the CLI skips an unchanged visibility and sends a
+scope request only for a real change.
 
 Every publish is cleaned, structurally checked, semantically aligned, and
 indexed by the server. HTTP 202 is followed until the durable admission is
@@ -1759,7 +1807,9 @@ owner's Studio; the server confirms an authorship receipt before the CLI
 records success. Updates, pulls, and deletes work only on content created
 through this same key (books rule applied to lessons); the key cannot edit,
 archive, or delete the owner's other content, and disabling delegation cuts
-access immediately.
+access immediately. Republishing skips an unchanged visibility; owner-delegated
+updates can revise content but visibility changes must be made in the owner's
+Studio.
 
 Contexts hold one key + site each (like kubectl). LUGUO_CONTEXT selects one
 per-run; LUGUO_API_KEY / LUGUO_BASE_URL override everything.`);
@@ -1790,6 +1840,11 @@ const table = {
   skill: cmdSkill,
   help: cmdHelp,
 };
+
+if (strictBooleanFlag(args, "help")) {
+  cmdHelp();
+  process.exit(0);
+}
 
 const fn = table[cmd];
 if (!fn) {

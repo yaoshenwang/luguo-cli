@@ -184,6 +184,33 @@ test("help documents automatic admission", async () => {
   }
 });
 
+test("--help short-circuits every subcommand without network or side effects", async () => {
+  const { root, home } = await tempProject();
+  const commands = [
+    "login", "logout", "register", "context", "contexts", "status", "whoami",
+    "doctor", "init", "validate", "outline", "publish", "pull", "delete",
+    "archive", "lessons", "books", "open", "home", "skill", "help",
+  ];
+  let requests = 0;
+  try {
+    await withMock((req, res) => {
+      requests += 1;
+      sendJson(res, 500, { error: "help must not reach the network" });
+    }, async (baseUrl) => {
+      for (const command of commands) {
+        const out = await runCli([command, "--help"], { cwd: root, home, baseUrl, key: "" });
+        assert.equal(out.code, 0, `${command}: ${out.stderr}`);
+        assert.match(out.stdout, /publish luma-md lessons and books/i, command);
+        assert.equal(out.stderr, "", command);
+      }
+    });
+    assert.equal(requests, 0);
+    await assert.rejects(readFile(join(root, "lesson.md"), "utf8"), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("init creates an admission-ready structural template", async () => {
   const { root, home } = await tempProject();
   const lessonPath = join(root, "ready-template.md");
@@ -504,6 +531,67 @@ test("lesson publish requires 201 ready, persists admission, and republish updat
   }
 });
 
+test("lesson update skips unchanged visibility and requests a separate scope change only when needed", async () => {
+  const { root, home } = await tempProject();
+  const lessonPath = join(root, "lesson.md");
+  await writeFile(lessonPath, LESSON);
+  const patches = [];
+  let currentVisibility = "private";
+  try {
+    await withMock(async (req, res) => {
+      if (req.method === "POST" && req.url === "/api/agent/lessons") {
+        sendJson(res, 201, {
+          lesson: {
+            id: "lesson_visibility_1",
+            slug: "visibility-lesson",
+            url: "/lessons/visibility-lesson",
+            visibility: currentVisibility,
+          },
+          admission: READY_ADMISSION,
+        });
+        return;
+      }
+      if (req.method === "PATCH" && req.url === "/api/lessons/lesson_visibility_1") {
+        const body = await readJsonBody(req);
+        patches.push(body);
+        if (body.visibility) currentVisibility = body.visibility;
+        sendJson(res, 200, {
+          lesson: {
+            id: "lesson_visibility_1",
+            slug: "visibility-lesson",
+            url: "/lessons/visibility-lesson",
+            visibility: currentVisibility,
+          },
+          ...(body.body ? { admission: READY_ADMISSION } : {}),
+        });
+        return;
+      }
+      sendJson(res, 404, { error: "Not found" });
+    }, async (baseUrl) => {
+      const created = await runCli(["publish", lessonPath], { cwd: root, home, baseUrl });
+      const unchanged = await runCli(["publish", lessonPath], { cwd: root, home, baseUrl });
+      const changed = await runCli(
+        ["publish", lessonPath, "--visibility", "public"],
+        { cwd: root, home, baseUrl },
+      );
+      assert.equal(created.code, 0, created.stderr);
+      assert.equal(unchanged.code, 0, unchanged.stderr);
+      assert.equal(changed.code, 0, changed.stderr);
+    });
+
+    assert.equal(patches.length, 3);
+    assert.ok(patches[0].body);
+    assert.equal(patches[0].visibility, undefined);
+    assert.ok(patches[1].body);
+    assert.equal(patches[1].visibility, undefined);
+    assert.deepEqual(patches[2], { visibility: "public" });
+    const state = JSON.parse(await readFile(join(root, ".luguo", "state.json"), "utf8"));
+    assert.equal(state.lessons["lesson.md"].visibility, "public");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("lesson publish retries an initial HTTP 500 with the same idempotency key", async () => {
   const { root, home } = await tempProject();
   const lessonPath = join(root, "lesson.md");
@@ -678,6 +766,97 @@ test("claimed owner publish is scoped, idempotent, verified, and opens the human
         legacyIdempotencyKey(baseUrl, "POST", "/api/agent/lessons", requests[3].body),
       );
     });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("owner update reads legacy visibility, patches content only, and verifies authorship", async () => {
+  const { root, home } = await tempProject();
+  const lessonPath = join(root, "lesson.md");
+  await writeFile(lessonPath, LESSON);
+  await mkdir(join(root, ".luguo"), { recursive: true });
+  await writeFile(join(root, ".luguo", "state.json"), JSON.stringify({
+    version: 2,
+    last: { kind: "lesson", key: "lesson.md" },
+    book: null,
+    lessons: {
+      "lesson.md": {
+        source: "lesson.md",
+        lesson_id: "lesson_owner_legacy_1",
+        lesson_slug: "owner-legacy",
+        reader_url: "https://example.invalid/lessons/owner-legacy",
+        workspace_url: "https://example.invalid/lessons/lesson_owner_legacy_1/edit",
+        publish_as: "owner",
+        authorship: OWNER_AUTHORSHIP,
+      },
+    },
+  }, null, 2));
+  const requests = [];
+  let patchNumber = 0;
+  try {
+    await withMock(async (req, res) => {
+      if (req.method === "GET" && req.url === "/api/v1/agent/home") {
+        requests.push({ method: "GET", path: req.url, mode: req.headers["x-luguo-act-as"] });
+        sendJson(res, 200, OWNER_HOME);
+        return;
+      }
+      if (req.method === "GET" && req.url === "/api/lessons/lesson_owner_legacy_1?format=luma-md") {
+        requests.push({ method: "GET", path: req.url, mode: req.headers["x-luguo-act-as"] });
+        sendJson(res, 200, {
+          lesson: { id: "lesson_owner_legacy_1", visibility: "private" },
+          authorship: OWNER_AUTHORSHIP,
+        });
+        return;
+      }
+      if (req.method === "PATCH" && req.url === "/api/lessons/lesson_owner_legacy_1") {
+        patchNumber += 1;
+        const body = await readJsonBody(req);
+        requests.push({ method: "PATCH", path: req.url, mode: req.headers["x-luguo-act-as"], body });
+        sendJson(res, 200, {
+          lesson: { id: "lesson_owner_legacy_1", slug: "owner-legacy", visibility: "private" },
+          admission: READY_ADMISSION,
+          ...(patchNumber === 1 ? { authorship: OWNER_AUTHORSHIP } : {}),
+        });
+        return;
+      }
+      sendJson(res, 404, { error: "Not found" });
+    }, async (baseUrl) => {
+      const updated = await runCli(["publish", lessonPath], { cwd: root, home, baseUrl });
+      assert.equal(updated.code, 0, updated.stderr);
+      assert.match(updated.stdout, /Lesson updated/);
+      assert.match(updated.stdout, /author\s+@mock-owner \(via @mock-agent\)/);
+
+      // The refreshed receipt now carries visibility, so the second update
+      // needs no metadata read. Its missing authorship must still fail closed.
+      const missingAuthorship = await runCli(["publish", lessonPath], { cwd: root, home, baseUrl });
+      assert.equal(missingAuthorship.code, 1);
+      assert.match(missingAuthorship.stderr, /did not return an authorship receipt/);
+
+      // A real delegated scope change is rejected locally before the content
+      // PATCH, matching the server's owner-only visibility boundary.
+      const changedVisibility = await runCli(
+        ["publish", lessonPath, "--visibility", "public"],
+        { cwd: root, home, baseUrl },
+      );
+      assert.equal(changedVisibility.code, 1);
+      assert.match(changedVisibility.stderr, /Owner delegation cannot change lesson visibility/);
+      assert.match(changedVisibility.stderr, /no lesson content was updated/);
+    });
+
+    const metadataReads = requests.filter((request) => request.path.includes("?format=luma-md"));
+    const contentPatches = requests.filter((request) => request.method === "PATCH");
+    assert.equal(metadataReads.length, 1);
+    assert.equal(metadataReads[0].mode, "owner");
+    assert.equal(contentPatches.length, 2);
+    for (const request of contentPatches) {
+      assert.equal(request.mode, "owner");
+      assert.ok(request.body.body);
+      assert.equal(request.body.visibility, undefined);
+    }
+    const state = JSON.parse(await readFile(join(root, ".luguo", "state.json"), "utf8"));
+    assert.equal(state.lessons["lesson.md"].visibility, "private");
+    assert.deepEqual(state.lessons["lesson.md"].authorship, OWNER_AUTHORSHIP);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
