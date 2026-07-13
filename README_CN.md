@@ -2,8 +2,8 @@
 
 把 **luma-md** 课程与书籍发布到 [炉果](https://luguo.ai)。luma-md 是标准
 Markdown 加几个 `:::` 教学围栏（`quiz` / `keypoints` / `example` /
-`tip|warn|note` / `explore` / `graph`）——运行 `luguo skill` 可从服务端拉取
-完整格式指南。
+`tip|warn|note` / `explore` / `graph` / 受控 `figure|audio|video`）——运行
+`luguo skill` 可从服务端拉取完整格式指南。
 
 每节课和每个非空书籍章节变为 ready 前，都会经过炉果统一的自动入库门禁：
 服务端清洗、结构检查、语义对齐和学习图谱索引。CLI 零运行时依赖，要求
@@ -83,6 +83,35 @@ visibility: private
 - **斜率符号**: 正斜率上升，负斜率下降，零斜率水平。
 :::
 ```
+
+### 受控媒体
+
+媒体二进制存放在炉果托管的资源库中。课程正文只引用资源 UUID，不能写 URL
+或本地文件路径：
+
+```md
+:::figure
+@asset 550e8400-e29b-41d4-a716-446655440000
+@alt 坐标平面中一条从左向右上升的直线。
+:::
+
+:::audio
+@asset 05f99c1d-f924-4ef0-9b2d-3f99e9cf2dc5
+@title 正斜率的语音讲解
+:::
+
+:::video
+@asset d9428888-122b-11e1-b85c-61cd3cbb3210
+@title 拖动两点匹配目标直线
+:::
+```
+
+每个 `figure`、`audio`、`video` 都必须且只能有一个规范的 `@asset` UUID；
+`figure` 还必须有非空 `@alt`，`audio` 和 `video` 必须有非空 `@title`。禁止
+直接媒体 URL、Markdown 图片（`![alt](url)`）和原始 HTML 媒体标签。
+`luguo validate` 会先在本地检查这些规则，再请求服务端；资源归属、就绪状态、
+MIME 类型和最终入库仍以服务端门禁为准。普通 Markdown 链接以及代码围栏中的
+媒体语法示例不受影响。
 
 ## 快速开始——发一本书（多章节）
 
@@ -213,7 +242,7 @@ luguo doctor                                   连通性 + key 检查
 # 创作
 luguo init [lesson.md] | init book [dir]       生成模板
 luguo outline <file.md> [--json]               本地分幕/节奏预览（离线）
-luguo validate <file.md | dir>                 服务端预检
+luguo validate <file.md | dir>                 本地媒体检查 + 服务端预检
 luguo skill [--save]                           拉取 luma-md 指南
 
 # 发布

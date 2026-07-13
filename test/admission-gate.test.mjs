@@ -179,6 +179,8 @@ test("help documents automatic admission", async () => {
     assert.match(out.stdout, /Allow publishing as me[\s\S]*same key[\s\S]*cannot edit/i);
     assert.match(out.stdout, /open \[path\] \[--workspace\|--edit\] \[--print\]/);
     assert.match(out.stdout, /retry transient network\/429\/5xx failures[\s\S]*three times/i);
+    assert.match(out.stdout, /Controlled media[\s\S]*@asset <UUID>[\s\S]*figure[\s\S]*@alt/i);
+    assert.match(out.stdout, /audio\/video require @title[\s\S]*Markdown images/i);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -418,6 +420,132 @@ test("validate sends luma-md to the server", async () => {
     });
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("validate accepts controlled figure, audio, and video asset UUIDs", async () => {
+  const { root, home } = await tempProject();
+  const lessonPath = join(root, "media.md");
+  const markdown = `${LESSON}
+
+[Ordinary links remain valid](https://example.com/reference).
+
+\`![Markdown image syntax](https://example.com/in-inline-code.png)\`
+
+\`\`\`md
+![Markdown image syntax](https://example.com/in-code-fence.png)
+<img src="https://example.com/in-code-fence.png">
+\`\`\`
+
+:::figure
+@asset 550e8400-e29b-41d4-a716-446655440000
+@alt A line rising from left to right on a coordinate plane.
+:::
+
+:::audio
+@asset 05f99c1d-f924-4ef0-9b2d-3f99e9cf2dc5
+@title Spoken explanation of positive slope
+:::
+
+:::video
+@asset d9428888-122b-11e1-b85c-61cd3cbb3210
+@title Dragging two points to match a target line
+:::
+`;
+  await writeFile(lessonPath, markdown);
+  let requests = 0;
+  try {
+    await withMock(async (req, res) => {
+      requests += 1;
+      assert.equal(req.method, "POST");
+      assert.equal(req.url, "/api/agent/validate");
+      const body = await readJsonBody(req);
+      assert.match(body.markdown, /:::figure[\s\S]*@asset 550e8400-e29b-41d4-a716-446655440000/);
+      assert.match(body.markdown, /:::audio[\s\S]*@title Spoken explanation/);
+      assert.match(body.markdown, /:::video[\s\S]*@title Dragging two points/);
+      sendJson(res, 200, {
+        valid: true,
+        blocks: 8,
+        scenes: 4,
+        block_counts: { heading: 1, quiz: 3, figure: 1, audio: 1, video: 1 },
+        warnings: [],
+      });
+    }, async (baseUrl) => {
+      const out = await runCli(["validate", lessonPath], { cwd: root, home, baseUrl });
+      assert.equal(out.code, 0, out.stderr);
+      assert.match(out.stdout, /OK: Mock admission lesson: 8 block\(s\), 4 scene\(s\)/);
+    });
+    assert.equal(requests, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("validate rejects unmanaged or malformed media before contacting the server", async (t) => {
+  const cases = [
+    {
+      name: "figure asset URL",
+      snippet: ":::figure\n@asset https://cdn.example.com/chart.png\n@alt A chart\n:::",
+      code: "media_asset_uuid",
+    },
+    {
+      name: "figure without alt",
+      snippet: ":::figure\n@asset 550e8400-e29b-41d4-a716-446655440000\n:::",
+      code: "figure_alt_required",
+    },
+    {
+      name: "audio without title",
+      snippet: ":::audio\n@asset 05f99c1d-f924-4ef0-9b2d-3f99e9cf2dc5\n:::",
+      code: "media_title_required",
+    },
+    {
+      name: "video without title",
+      snippet: ":::video\n@asset d9428888-122b-11e1-b85c-61cd3cbb3210\n:::",
+      code: "media_title_required",
+    },
+    {
+      name: "duplicate asset",
+      snippet: ":::figure\n@asset 550e8400-e29b-41d4-a716-446655440000\n@asset 05f99c1d-f924-4ef0-9b2d-3f99e9cf2dc5\n@alt A chart\n:::",
+      code: "media_field_duplicate",
+    },
+    {
+      name: "Markdown image",
+      snippet: "![Remote chart](https://cdn.example.com/chart.png)",
+      code: "markdown_image_forbidden",
+    },
+    {
+      name: "raw HTML image",
+      snippet: "<img src=\"https://cdn.example.com/chart.png\" alt=\"A chart\">",
+      code: "html_media_forbidden",
+    },
+    {
+      name: "unclosed media fence",
+      snippet: ":::figure\n@asset 550e8400-e29b-41d4-a716-446655440000\n@alt A chart",
+      code: "media_fence_unclosed",
+    },
+  ];
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const { root, home } = await tempProject();
+      const lessonPath = join(root, "invalid-media.md");
+      await writeFile(lessonPath, `${LESSON}\n\n${item.snippet}\n`);
+      let requests = 0;
+      try {
+        await withMock((_req, res) => {
+          requests += 1;
+          sendJson(res, 500, { error: "local validation should have stopped this request" });
+        }, async (baseUrl) => {
+          const out = await runCli(["validate", lessonPath], { cwd: root, home, baseUrl });
+          assert.equal(out.code, 1);
+          assert.match(out.stderr, /controlled media contract failed/);
+          assert.match(out.stderr, new RegExp(`\\[${item.code}\\]`));
+        });
+        assert.equal(requests, 0);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
   }
 });
 

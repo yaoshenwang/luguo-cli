@@ -607,6 +607,150 @@ function loadLessonFile(path) {
   };
 }
 
+const CONTROLLED_MEDIA_FENCES = new Set(["figure", "audio", "video"]);
+const CANONICAL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const URL_LIKE_RE = /(?:https?:\/\/|data:|blob:|\/\/[^\s])/i;
+
+// Media is referenced by an immutable luguo asset UUID. Local validation is
+// intentionally narrow: the server remains authoritative for asset ownership,
+// readiness, MIME type, and admission. Code fences are skipped so lessons may
+// still teach Markdown/HTML without their examples being treated as media.
+function validateControlledMedia(markdown) {
+  const issues = [];
+  const lines = markdown.split(/\r?\n/);
+  let codeFence = null;
+  let media = null;
+
+  const addIssue = (line, code, message) => issues.push({ line, code, message });
+  const finishMedia = () => {
+    if (!media) return;
+    const asset = media.fields.get("asset")?.trim() || "";
+    if (!asset || !CANONICAL_UUID_RE.test(asset) || /^0{8}-0{4}-0{4}-0{4}-0{12}$/.test(asset)) {
+      addIssue(
+        media.fieldLines.get("asset") || media.line,
+        "media_asset_uuid",
+        `:::${media.kind} requires @asset with a canonical, non-zero UUID; URLs and file paths are not allowed.`,
+      );
+    }
+    if (media.kind === "figure" && !(media.fields.get("alt")?.trim())) {
+      addIssue(media.line, "figure_alt_required", ":::figure requires a non-empty @alt description.");
+    }
+    if ((media.kind === "audio" || media.kind === "video") && !(media.fields.get("title")?.trim())) {
+      addIssue(media.line, "media_title_required", `:::${media.kind} requires a non-empty @title.`);
+    }
+    media = null;
+  };
+
+  lines.forEach((line, index) => {
+    const lineNumber = index + 1;
+    const trimmed = line.trim();
+
+    if (!media) {
+      if (codeFence) {
+        if (new RegExp(`^${codeFence.char}{${codeFence.length},}\\s*$`).test(trimmed)) codeFence = null;
+        return;
+      }
+      const codeOpen = trimmed.match(/^(`{3,}|~{3,})/);
+      if (codeOpen) {
+        codeFence = { char: codeOpen[1][0], length: codeOpen[1].length };
+        return;
+      }
+
+      const prose = line.replace(/`[^`]*`/g, "");
+      if (/(^|[^\\])!\[[^\]]*\]/.test(prose)) {
+        addIssue(
+          lineNumber,
+          "markdown_image_forbidden",
+          "Markdown images are not allowed; use :::figure with an @asset UUID and @alt.",
+        );
+      }
+      if (/<\/?(?:img|picture|audio|video|source)\b/i.test(prose)) {
+        addIssue(
+          lineNumber,
+          "html_media_forbidden",
+          "Raw HTML media is not allowed; use a controlled :::figure, :::audio, or :::video fence.",
+        );
+      }
+
+      const open = trimmed.match(/^:::\s*(figure|audio|video)\b/i);
+      if (open) {
+        media = {
+          kind: open[1].toLowerCase(),
+          line: lineNumber,
+          fields: new Map(),
+          fieldLines: new Map(),
+        };
+      }
+      return;
+    }
+
+    if (trimmed === ":::") {
+      finishMedia();
+      return;
+    }
+
+    const mediaProse = line.replace(/`[^`]*`/g, "");
+    if (/(^|[^\\])!\[[^\]]*\]/.test(mediaProse)) {
+      addIssue(
+        lineNumber,
+        "markdown_image_forbidden",
+        "Markdown images are not allowed; use @asset <UUID> inside the controlled media fence.",
+      );
+    }
+    if (/<\/?(?:img|picture|audio|video|source)\b/i.test(mediaProse)) {
+      addIssue(
+        lineNumber,
+        "html_media_forbidden",
+        "Raw HTML media is not allowed inside a controlled media fence.",
+      );
+    }
+
+    const directive = trimmed.match(/^@([A-Za-z][\w-]*)\s*(.*)$/);
+    if (directive) {
+      const key = directive[1].toLowerCase();
+      const value = directive[2].trim();
+      if (media.fields.has(key)) {
+        addIssue(lineNumber, "media_field_duplicate", `:::${media.kind} has duplicate @${key}.`);
+      } else {
+        media.fields.set(key, value);
+        media.fieldLines.set(key, lineNumber);
+      }
+      if (["src", "url", "href"].includes(key) || URL_LIKE_RE.test(value)) {
+        addIssue(
+          lineNumber,
+          "media_url_forbidden",
+          "Media URLs are not allowed; reference a managed asset with @asset <UUID>.",
+        );
+      }
+      return;
+    }
+
+    if (URL_LIKE_RE.test(trimmed)) {
+      addIssue(
+        lineNumber,
+        "media_url_forbidden",
+        "Media URLs are not allowed; reference a managed asset with @asset <UUID>.",
+      );
+    }
+  });
+
+  if (media) {
+    addIssue(media.line, "media_fence_unclosed", `:::${media.kind} is missing its closing ::: fence.`);
+    finishMedia();
+  }
+  return issues;
+}
+
+function printControlledMediaIssues(markdown, label) {
+  const issues = validateControlledMedia(markdown);
+  if (!issues.length) return true;
+  console.error(c.red(`Invalid: ${label}: controlled media contract failed`));
+  for (const issue of issues) {
+    console.error(`  line ${issue.line} [${issue.code}]: ${issue.message}`);
+  }
+  return false;
+}
+
 function loadBookDir(root) {
   const yamlPath = ["luguo.yml", "luguo.yaml", "book.yml"].map((n) => join(root, n)).find(existsSync);
   const config = yamlPath ? parseFlatYaml(readFileSync(yamlPath, "utf8")) : {};
@@ -1145,6 +1289,10 @@ async function cmdValidate(args) {
     info(`${c.bold(book.title)} — ${book.chapters.length} chapter(s)`);
     let valid = true;
     for (const chapter of book.chapters) {
+      if (!printControlledMediaIssues(chapter.markdown, chapter.source)) {
+        valid = false;
+        continue;
+      }
       const out = await serverValidate(creds, chapter.markdown);
       valid = printValidation(out, chapter.source) && valid;
     }
@@ -1152,6 +1300,7 @@ async function cmdValidate(args) {
     return;
   }
   const lesson = loadLessonFile(input);
+  if (!printControlledMediaIssues(lesson.markdown, lesson.title)) process.exit(1);
   const out = await serverValidate(creds, lesson.markdown);
   if (!printValidation(out, lesson.title)) process.exit(1);
 }
@@ -1604,7 +1753,10 @@ async function cmdDelete(args) {
 // Mirrors the server's scene rules: H1/H2 and --- start a new scene; every
 // quiz/explore/graph fence is its own scene. Approximation for pacing review.
 const SCENE_FENCES = new Set(["quiz", "explore", "graph"]);
-const KNOWN_FENCES = new Set(["quiz", "keypoints", "example", "tip", "warn", "note", "explore", "graph"]);
+const KNOWN_FENCES = new Set([
+  "quiz", "keypoints", "example", "tip", "warn", "note", "explore", "graph",
+  ...CONTROLLED_MEDIA_FENCES,
+]);
 
 function outlineLumaDoc(markdown) {
   const scenes = [];
@@ -1716,7 +1868,7 @@ Authoring:
   luguo init [lesson.md]                         create a lesson template
   luguo init book [dir]                          create a book project (luguo.yml + chapters)
   luguo outline <file.md> [--json]               local scene/pacing preview (no network)
-  luguo validate <file.md | dir>                 server-side validation preview
+  luguo validate <file.md | dir>                 local media checks + server validation preview
   luguo skill [--save]                           fetch the luma-md guide (/skill.md)
 
 Publishing:
@@ -1733,6 +1885,11 @@ Publishing:
 A lesson is one .md file: YAML frontmatter (title/summary/tags/visibility/
 language/emoji) + a luma-md body. A book is a directory: optional luguo.yml
 (same fields + chapters list) + one .md per chapter, sorted by filename.
+
+Controlled media uses :::figure / :::audio / :::video. Every block requires
+@asset <UUID>; figure also requires @alt, while audio/video require @title.
+Direct URLs, Markdown images (![](...)), and raw HTML media are invalid. Asset
+ownership, readiness, and MIME type are still verified by the server gate.
 
 Republishing a file whose receipt is known UPDATES the existing lesson in
 place (same URL, same @id answer history); pass --new to force a fresh lesson

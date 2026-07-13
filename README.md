@@ -2,8 +2,9 @@
 
 Publish **luma-md** lessons and books to [luguo](https://luguo.ai). luma-md is
 plain Markdown plus a few `:::` teaching fences (`quiz` / `keypoints` /
-`example` / `tip|warn|note` / `explore` / `graph`) — run `luguo skill` for the
-full format guide, straight from the server.
+`example` / `tip|warn|note` / `explore` / `graph` / controlled
+`figure|audio|video`) — run `luguo skill` for the full format guide, straight
+from the server.
 
 Every lesson and non-empty book chapter passes luguo's automatic admission gate
 before it becomes ready: server-side cleaning, structural checks, semantic
@@ -84,6 +85,36 @@ visibility: private
 - **斜率符号**: 正斜率上升，负斜率下降，零斜率水平。
 :::
 ```
+
+### Controlled media
+
+Media binaries live in luguo's managed asset store. Reference the asset UUID;
+never put a URL or file path in lesson Markdown:
+
+```md
+:::figure
+@asset 550e8400-e29b-41d4-a716-446655440000
+@alt A coordinate plane showing a line rising from left to right.
+:::
+
+:::audio
+@asset 05f99c1d-f924-4ef0-9b2d-3f99e9cf2dc5
+@title Spoken explanation of positive slope
+:::
+
+:::video
+@asset d9428888-122b-11e1-b85c-61cd3cbb3210
+@title Dragging two points to match a target line
+:::
+```
+
+Every `figure`, `audio`, and `video` requires exactly one canonical `@asset`
+UUID. A `figure` also requires non-empty `@alt`; `audio` and `video` require
+non-empty `@title`. Direct media URLs, Markdown images (`![alt](url)`), and raw
+HTML media tags are invalid. `luguo validate` checks these rules locally before
+calling the server, which remains authoritative for ownership, readiness, MIME
+type, and admission. Ordinary Markdown links and media syntax inside fenced
+code examples are unaffected.
 
 ## Quick start — a book (multi-chapter)
 
@@ -226,7 +257,7 @@ luguo doctor                                   connectivity + key check
 # authoring
 luguo init [lesson.md] | init book [dir]       templates
 luguo outline <file.md> [--json]               local scene/pacing preview (offline)
-luguo validate <file.md | dir>                 preview server-side validation
+luguo validate <file.md | dir>                 local media checks + server validation
 luguo skill [--save]                           fetch the luma-md guide
 
 # publishing

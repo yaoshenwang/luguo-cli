@@ -4,6 +4,20 @@ All notable changes to `luguo-cli` are documented here. This project follows
 [Semantic Versioning](https://semver.org/) and the
 [Keep a Changelog](https://keepachangelog.com/) format.
 
+## [0.1.10] - 2026-07-13
+
+### Added
+- Documented controlled luma-md `figure`, `audio`, and `video` fences. Every
+  block references a managed asset by canonical UUID; figures require `@alt`,
+  while audio and video require `@title`.
+- `luguo validate` now rejects malformed controlled media locally before the
+  server request, including URL/file-path assets, Markdown images, and raw HTML
+  media, while leaving fenced code examples and ordinary links untouched.
+
+### Changed
+- The offline outline recognizes controlled media fences as regular content
+  blocks. API endpoints, request shapes, and the default site are unchanged.
+
 ## [0.1.9] - 2026-07-12
 
 ### Added
