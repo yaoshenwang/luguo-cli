@@ -123,6 +123,44 @@ emoji: 📈
 `publish` creates the book, adds every chapter in order, then flips the book's
 visibility once (the publish cascade covers all chapter lessons). It prints the
 reader URL (`/books/<slug>`) and the creator workspace URL (`/create/<id>`).
+Private books run the same final atomic commit and become `ready` without
+changing their private visibility.
+
+For a real textbook, point `luguo.yml` at a strict outline instead of using the
+flat `chapters` list:
+
+```yaml
+outline: outline.json
+```
+
+```json
+{
+  "version": 1,
+  "units": [{
+    "key": "unit-1",
+    "title": "Algebra foundations",
+    "position": 1,
+    "modules": [{
+      "key": "unit-1-module-1",
+      "title": "Linear relationships",
+      "position": 1,
+      "chapters": [{ "file": "01-slope.md", "position": 1 }]
+    }]
+  }]
+}
+```
+
+`validate` and `publish` normalize the outline, require stable globally unique
+Unit/Module keys and unique sibling positions, and fail closed unless every
+publishable `.md` is listed exactly once. The SHA-256 of that normalized outline
+is bound to the book, every chapter request, and the local receipt. The reader
+and Studio show `Unit → Module → Topic`; projects without `outline` keep the
+existing flat structure behavior.
+
+Each chapter's frontmatter may override `tags`, `language`, and `emoji`; omitted
+values inherit the book metadata. The CLI sends those normalized topic values
+and records them in the receipt. Chapter-level `visibility` is never sent—the
+book owns one publication scope for every topic.
 
 ## Publishing identity
 
