@@ -167,6 +167,25 @@ async function tempProject() {
   return { root, home };
 }
 
+function assertFoldSafeKeypoints(markdown, label) {
+  const keypointCount = (markdown.match(/^:::keypoints\b/gm) || []).length;
+  const foldingPairs = [...markdown.matchAll(
+    /^:::keypoints\b[^\n]*\n[\s\S]*?^@skills\s+([^\n]+)\n^:::\n\n^:::quiz\b[^\n]*\n[\s\S]*?^@skills\s+([^\n]+)\n/gm,
+  )];
+  assert.ok(keypointCount > 0, `${label}: expected at least one keypoints block`);
+  assert.equal(foldingPairs.length, keypointCount, `${label}: every keypoints block needs an adjacent verification quiz`);
+  for (const pair of foldingPairs) {
+    assert.equal(pair[1], pair[2], `${label}: keypoints and verification quiz skills must match exactly`);
+  }
+
+  const quizSkills = [...markdown.matchAll(/^:::quiz\b[^\n]*\n([\s\S]*?)^:::$/gm)]
+    .flatMap((match) => match[1].match(/^@skills\s+(.+)$/m)?.[1].split(",") ?? [])
+    .map((skill) => skill.trim())
+    .filter(Boolean);
+  const distinctSkills = new Set(quizSkills);
+  assert.ok(distinctSkills.size >= 3 && distinctSkills.size <= 8, `${label}: expected 3–8 distinct quiz skills`);
+}
+
 test("help documents automatic admission", async () => {
   const { root, home } = await tempProject();
   try {
@@ -179,6 +198,8 @@ test("help documents automatic admission", async () => {
     assert.match(out.stdout, /Allow publishing as me[\s\S]*same key[\s\S]*cannot edit/i);
     assert.match(out.stdout, /open \[path\] \[--workspace\|--edit\] \[--print\]/);
     assert.match(out.stdout, /retry transient network\/429\/5xx failures[\s\S]*three times/i);
+    assert.match(out.stdout, /Every :::keypoints fence[\s\S]*complete scene skill set[\s\S]*exactly the same @skills set[\s\S]*fold\s+safely/i);
+    assert.match(out.stdout, /3–8 distinct skills[\s\S]*action \+ object/i);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -226,13 +247,29 @@ test("init creates an admission-ready structural template", async () => {
     assert.equal((markdown.match(/^:::quiz\b/gm) || []).length, 3);
     // 3 quiz ids + 1 explore id (the :::explore sample ships with the template)
     assert.equal((markdown.match(/^@id\s+/gm) || []).length, 4);
-    assert.equal((markdown.match(/^@skills\s+/gm) || []).length, 3);
+    const skillLines = [...markdown.matchAll(/^@skills\s+(.+)$/gm)].map((match) => match[1]);
+    assert.equal(skillLines.length, 4);
+    assert.equal(new Set(skillLines).size, 3);
     assert.equal((markdown.match(/^@steps\s+/gm) || []).length, 3);
     assert.match(markdown, /^:::keypoints\b/m);
+    assertFoldSafeKeypoints(markdown, "generated lesson template");
     assert.match(markdown, /^:::example\b/m);
     assert.match(markdown, /"domain": \[-8, 8\]/);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("bilingual docs and bundled examples keep fold-safe keypoints", async () => {
+  const files = [
+    "README.md",
+    "README_CN.md",
+    "examples/lesson.md",
+    "examples/luma-book/01-第一章.md",
+    "examples/luma-book/02-第二章.md",
+  ];
+  for (const file of files) {
+    assertFoldSafeKeypoints(await readFile(join(REPO_ROOT, file), "utf8"), file);
   }
 });
 
