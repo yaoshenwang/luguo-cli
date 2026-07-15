@@ -122,6 +122,11 @@ visibility: private
 
 正文是标准 Markdown……
 
+:::keypoints
+- **斜率符号**: 正斜率上升，负斜率下降，零斜率水平。
+@skills 判断斜率方向
+:::
+
 :::quiz 斜率为负代表什么?
 - [ ] 直线水平
 - [x] 直线下降
@@ -152,12 +157,14 @@ visibility: private
 @steps 比较斜率符号,判断变化方向,排除反例
 :::
 
-:::keypoints
-- **斜率符号**: 正斜率上升，负斜率下降，零斜率水平。
-:::
 ```
 
-Use 3–8 distinct `@skills` per lesson. Name each as an observable **action +
+Every `:::keypoints` fence must include an `@skills` line containing the
+complete skill set for that pedagogical scene. Its corresponding verification
+quiz—normally the single quiz immediately following the keypoints block—must
+repeat exactly the same `@skills` set. This explicit scene-to-skill contract
+lets mastered prose fold safely while retaining its summary and check. Across
+the lesson, keep 3–8 distinct skills and name each as an observable **action +
 object** that one question can test, such as `compare fractions with equal
 denominators`; avoid vague “understand/master X” labels. Every quiz should have
 at least two plausible distractors based on different misconceptions, never

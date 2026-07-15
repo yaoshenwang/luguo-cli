@@ -2152,16 +2152,17 @@ visibility: private
 正文是标准 Markdown,支持 $LaTeX$、表格、代码块。
 提问驱动、先让读者预测再揭晓,比平铺定义更有效。
 
-:::keypoints 核心概念
-- **概念 A**: 一句话定义，以及它适用的条件
-:::
-
 :::example 例 1:示范怎么想,不只是怎么算
 题干写在这里。
 @approach 先写"为什么从这里入手"。
 1. 第一步,以及这一步为什么成立。
 2. 第二步。
 @answer 最终答案
+:::
+
+:::keypoints 核心概念
+- **概念 A**: 一句话定义，以及它适用的条件
+@skills 识别概念 A 的适用条件
 :::
 
 :::quiz 检查题一?
@@ -2910,9 +2911,13 @@ Admission repairs are deterministic metadata cleanup only (for example,
 @id: to @id ). The server never invents missing quizzes, answers, or teaching
 metadata; fix the reported HTTP 422 issues in the source and publish again.
 
-Use 3–8 distinct @skills per lesson. Each skill must be an observable action +
-object that one question can test. Every quiz needs two plausible distractors
-from different misconceptions; avoid duplicate or all/none filler choices.
+Every :::keypoints fence must declare the complete scene skill set in @skills.
+Its corresponding verification quiz—normally the single quiz immediately
+after it—must repeat exactly the same @skills set so mastered prose can fold
+safely while keeping its summary and check. Keep 3–8 distinct skills per
+lesson, each named as an observable action + object that one question can test.
+Every quiz needs two plausible distractors from different misconceptions;
+avoid duplicate or all/none filler choices.
 
 Republishing a file whose receipt is known UPDATES the existing lesson in
 place (same URL, same @id answer history); pass --new to force a fresh lesson

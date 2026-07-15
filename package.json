@@ -1,6 +1,6 @@
 {
   "name": "luguo-cli",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "Author private luma-md drafts and publish lessons and books to luguo (炉果).",
   "type": "module",
   "bin": {
