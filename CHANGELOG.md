@@ -4,6 +4,15 @@ All notable changes to `luguo-cli` are documented here. This project follows
 [Semantic Versioning](https://semver.org/) and the
 [Keep a Changelog](https://keepachangelog.com/) format.
 
+## [0.1.14] - 2026-07-15
+
+### Changed
+- Lesson and book templates now demonstrate 3–8 distinct, testable
+  action–object `@skills` and at least two misconception-based distractors per
+  quiz, matching the book-spine admission guidance.
+- English and Chinese authoring docs and built-in help explain the same skill
+  granularity and distractor-quality rules.
+
 ## [0.1.13] - 2026-07-13
 
 ### Added
@@ -215,6 +224,7 @@ First public release.
 - Zero runtime dependencies (pure Node ≥ 18, using the global `fetch` and `node:` builtins).
 - Credentials stored at `~/.config/luguo/credentials.json` with `0600` permissions.
 
+[0.1.14]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.12...v0.1.13
 [0.1.7]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/yaoshenwang/luguo-cli/compare/v0.1.5...v0.1.6

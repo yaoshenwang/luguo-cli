@@ -125,27 +125,30 @@ visibility: private
 :::quiz 斜率为负代表什么?
 - [ ] 直线水平
 - [x] 直线下降
+- [ ] 直线上升
 @id q-slope-sign
 @explain k < 0 时 x 增大 y 减小。
-@skills 斜率符号
+@skills 判断斜率方向
 @steps 读取 k 的符号,判断 y 的变化方向,检查图像趋势
 :::
 
 :::quiz k = 0 时直线怎样?
 - [x] 水平
 - [ ] 竖直
+- [ ] 向下倾斜
 @id q-slope-zero
 @explain y 不随 x 变化，所以直线水平。
-@skills 斜率符号
+@skills 识别零斜率图像
 @steps 代入 k=0,化简函数,匹配图像
 :::
 
 :::quiz 哪条直线随 x 增大而上升?
 - [ ] k = -2
 - [x] k = 2
+- [ ] k = 0
 @id q-slope-positive
 @explain 正斜率表示 y 随 x 增大而增大。
-@skills 斜率符号
+@skills 比较斜率方向
 @steps 比较斜率符号,判断变化方向,排除反例
 :::
 
@@ -153,6 +156,12 @@ visibility: private
 - **斜率符号**: 正斜率上升，负斜率下降，零斜率水平。
 :::
 ```
+
+Use 3–8 distinct `@skills` per lesson. Name each as an observable **action +
+object** that one question can test, such as `compare fractions with equal
+denominators`; avoid vague “understand/master X” labels. Every quiz should have
+at least two plausible distractors based on different misconceptions, never
+duplicate choices or “all/none of the above” filler.
 
 ## Quick start — a book (multi-chapter)
 

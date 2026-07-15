@@ -2153,7 +2153,7 @@ visibility: private
 提问驱动、先让读者预测再揭晓,比平铺定义更有效。
 
 :::keypoints 核心概念
-- **概念 A**: 一句话定义
+- **概念 A**: 一句话定义，以及它适用的条件
 :::
 
 :::example 例 1:示范怎么想,不只是怎么算
@@ -2166,28 +2166,31 @@ visibility: private
 
 :::quiz 检查题一?
 - [x] 正确选项
-- [ ] 错误选项
+- [ ] 忽略关键条件后会选的答案
+- [ ] 混淆相近概念后会选的答案
 @id q-demo-1
 @explain 为什么正确选项对。数学可用 $...$,也可写纯文本(如 0.2×0.3÷0.4 = 0.15)。
-@skills 概念 A
+@skills 识别概念 A 的适用条件
 @steps 识别条件,应用概念 A,检查结论
 :::
 
 :::quiz 检查题二?
 - [ ] 常见误解
 - [x] 正确结论
+- [ ] 使用了错误规则的结论
 @id q-demo-2
 @explain 用另一个场景确认概念 A。干扰项要对应真实错误,不是随机凑数。
-@skills 概念 A
+@skills 比较概念 A 的备选结论
 @steps 提取信息,比较选项,验证答案
 :::
 
 :::quiz 检查题三?
 - [x] 可以迁移到新场景的结论
 - [ ] 只复述题面但不成立的结论
+- [ ] 套用了相邻概念的结论
 @id q-demo-3
 @explain 把概念 A 迁移到新场景仍得到同一规则。
-@skills 概念 A
+@skills 应用概念 A 解决新问题
 @steps 识别新场景,迁移规则,反例检查
 :::
 
@@ -2906,6 +2909,10 @@ admission cleaning and semantic review. Use descriptive alt text, prose, or a
 Admission repairs are deterministic metadata cleanup only (for example,
 @id: to @id ). The server never invents missing quizzes, answers, or teaching
 metadata; fix the reported HTTP 422 issues in the source and publish again.
+
+Use 3–8 distinct @skills per lesson. Each skill must be an observable action +
+object that one question can test. Every quiz needs two plausible distractors
+from different misconceptions; avoid duplicate or all/none filler choices.
 
 Republishing a file whose receipt is known UPDATES the existing lesson in
 place (same URL, same @id answer history); pass --new to force a fresh lesson
